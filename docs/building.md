@@ -54,14 +54,28 @@ Backups window shows, such as `me.pxar/Documents`.
 
 ## Releasing
 
+Put the new version into `VERSION`, commit, and push a tag for it:
+
 ```sh
-just release 0.1.0
+git tag -a v0.1.1 -m "What changed"
+git push origin v0.1.1
 ```
 
-builds, signs and notarizes `dist/PBSMackup-0.1.0.zip`, and writes the Homebrew cask for it to
+The release workflow (`.github/workflows/release.yml`) builds the client from `client.commit`,
+builds, signs and notarizes the app, creates the GitHub release `v0.1.1` with the zip (the tag's
+message as its notes) and puts the cask into the tap. The secrets it needs are listed at the top of
+the workflow.
+
+To make the same release on this Mac instead:
+
+```sh
+just release 0.1.1
+```
+
+builds, signs and notarizes `dist/PBSMackup-0.1.1.zip`, and writes the Homebrew cask for it to
 `dist/pbs-mackup.rb`. It needs a notarytool keychain profile (`PBS_MACKUP_NOTARY_PROFILE`, `pbs-mackup`
 when not set), stored once with `xcrun notarytool store-credentials`. Attach the zip to the
-GitHub release `v0.1.0` and copy the cask into the tap's `Casks` folder.
+GitHub release `v0.1.1` and copy the cask into the tap's `Casks` folder.
 
 `PBS_MACKUP_BUNDLE_ID` sets the bundle identifier, which is also the Keychain service and, with
 `.run` appended, the launchd job. Changing it makes a different app as far as macOS is

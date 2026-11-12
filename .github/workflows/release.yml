@@ -1,0 +1,135 @@
+# Builds, signs and notarizes a release when a tag vX.Y.Z is pushed, attaches the zip to the
+# GitHub release vX.Y.Z and puts the cask into 0x23me/homebrew-tap. The tag has to match VERSION.
+# The message of an annotated tag becomes the release notes.
+#
+# Secrets:
+#   DEVELOPER_ID_CERTIFICATE           the Developer ID Application certificate with its key, .p12, base64
+#   DEVELOPER_ID_CERTIFICATE_PASSWORD  the password of that .p12
+#   NOTARY_KEY                         an App Store Connect API key, the content of its AuthKey_….p8
+#   NOTARY_KEY_ID, NOTARY_ISSUER       that key's ID and its issuer ID
+#   TAP_TOKEN                          a token that can push to 0x23me/homebrew-tap; without it the
+#                                      cask is only kept as an artifact of the run
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Homebrew's OpenSSL and zstd are linked into the client, built for the runner's macOS;
+    # this has to be the macOS version the app asks for (LSMinimumSystemVersion in bundle.sh).
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: pbs-mackup
+
+      - name: Check the tag against VERSION
+        id: version
+        working-directory: pbs-mackup
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "$version" = "$(tr -d '[:space:]' < VERSION)" ] || {
+            echo "::error::the tag is $GITHUB_REF_NAME, VERSION says $(cat VERSION)"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "client=$(tr -d '[:space:]' < client.commit)" >> "$GITHUB_OUTPUT"
+
+      # bundle.sh takes the client from ../proxmox-backup-macos and checks it was built from client.commit.
+      - uses: actions/checkout@v5
+        with:
+          repository: 0x23me/proxmox-backup-macos
+          ref: ${{ steps.version.outputs.client }}
+          path: proxmox-backup-macos
+          submodules: recursive
+
+      - name: Install the client's build dependencies
+        run: |
+          brew install openssl@3 zstd pkgconf
+          brew install --cask fuse-t
+          rustc --version
+
+      - name: Build the client
+        working-directory: proxmox-backup-macos
+        run: |
+          scripts/macos/cargo.sh build --release --package proxmox-backup-client
+          env -u PBS_REPOSITORY native-target/release/proxmox-backup-client version
+
+      - name: Import the signing certificate
+        env:
+          CERTIFICATE: ${{ secrets.DEVELOPER_ID_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(uuidgen)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user | xargs security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain"
+
+      - name: Build, sign and notarize
+        working-directory: pbs-mackup
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+          PBS_MACKUP_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          PBS_MACKUP_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          export PBS_MACKUP_NOTARY_KEY="$RUNNER_TEMP/notary.p8"
+          printf '%s\n' "$NOTARY_KEY" > "$PBS_MACKUP_NOTARY_KEY"
+          ./Scripts/release.sh "$VERSION"
+          rm "$PBS_MACKUP_NOTARY_KEY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: pbs-mackup/dist/
+
+      - name: Publish the release
+        working-directory: pbs-mackup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          CLIENT: ${{ steps.version.outputs.client }}
+        run: |
+          git fetch --depth=1 origin "+refs/tags/v$VERSION:refs/tags/v$VERSION"
+          notes=""
+          [ "$(git cat-file -t "v$VERSION")" = tag ] && notes="$(git tag -l --format='%(contents)' "v$VERSION")"
+          notes="${notes:+$notes
+
+          }Client built from 0x23me/proxmox-backup-macos at ${CLIENT:0:7}."
+          gh release create "v$VERSION" --verify-tag --title "$VERSION" --notes "$notes" \
+            "dist/PBSMackup-$VERSION.zip" "dist/PBSMackup-$VERSION.zip.sha256"
+
+      - name: Update the Homebrew tap
+        working-directory: pbs-mackup
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          [ -n "$TAP_TOKEN" ] || { echo "::warning::no TAP_TOKEN; copy pbs-mackup.rb from the run's artifact into the tap"; exit 0; }
+          tap="$RUNNER_TEMP/tap"
+          git clone --depth=1 "https://x-access-token:$TAP_TOKEN@github.com/0x23me/homebrew-tap.git" "$tap"
+          cp dist/pbs-mackup.rb "$tap/Casks/pbs-mackup.rb"
+          cd "$tap"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "pbs-mackup $VERSION"
+          git push
+
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
