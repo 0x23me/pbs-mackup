@@ -56,6 +56,9 @@ public struct Client {
         environment["PBS_REPOSITORY"] = config.repository
         environment["PBS_PASSWORD"] = String(decoding: token, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         environment["PBS_FINGERPRINT"] = config.fingerprint
+        // The client's OpenSSL looks for the trusted roots where Homebrew keeps them. A Mac
+        // without Homebrew has none there, so it gets the ones macOS ships.
+        if environment["SSL_CERT_FILE"] == nil { environment["SSL_CERT_FILE"] = "/etc/ssl/cert.pem" }
         process.environment = environment
         process.standardInput = Pipe()
         return process
