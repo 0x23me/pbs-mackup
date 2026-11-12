@@ -310,7 +310,7 @@ private struct MenuRow: View {
     var opens = false
     let action: () -> Void
     @Environment(\.isEnabled) private var enabled
-    @State private var hovered = false
+    @SwiftUI.State private var hovered = false
 
     var body: some View {
         Button(action: action) {

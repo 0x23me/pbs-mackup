@@ -10,7 +10,7 @@ private func size(_ bytes: Int64) -> String {
 /// needed; beside it what is usually not worth keeping, and the rules made so far.
 struct WhatToBackUpView: View {
     @ObservedObject var model: SettingsModel
-    @State private var pattern = ""
+    @SwiftUI.State private var pattern = ""
 
     static let intervals: [(minutes: Int, title: String)] = [
         (15, "15 minutes"), (30, "30 minutes"), (60, "hour"), (120, "2 hours"), (240, "4 hours"),
