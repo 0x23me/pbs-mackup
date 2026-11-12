@@ -50,13 +50,8 @@ cask "pbs-mackup" do
   ]
 
   caveats <<~EOS
-    Backups read from a frozen snapshot of the disk, which needs Full Disk Access:
-    System Settings, Privacy & Security, Full Disk Access, switch on PBS Mackup.
-
-    The encryption key and the API token are in your login Keychain and stay there
-    when the app is removed. Keep the recovery copy of the key somewhere else.
-
-    Open in Finder needs FUSE-T (brew install --cask fuse-t). Everything else works without.
+    Switch on Full Disk Access for PBS Mackup in System Settings.
+    Open in Finder needs FUSE-T: brew install --cask fuse-t
   EOS
 end
 CASK

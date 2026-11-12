@@ -40,9 +40,10 @@ Each folder in `sources` becomes one archive named after it. `excludes` are the 
 patterns, as in `.pxarexclude`. Always left out as well: `.DS_Store`, `.Trash`, `.Trashes`,
 `.TemporaryItems`, `.Spotlight-V100`, `.fseventsd`, `.DocumentRevisions-V100`, a home folder's
 `Library/Caches`, anything excluded from Time Machine, and files whose contents are only in
-iCloud. `intervalMinutes` is how often a backup is made; an hour when absent. `sampleFiles` (20 when absent, 0 for none) is how many files are restored and compared
-after each backup. The secrets are stored with
-`pbs-mackup-run set-token` and `pbs-mackup-run set-key`, each reading standard input.
+iCloud, and socket files. `intervalMinutes` is how often a backup is made; an hour when
+absent. `sampleFiles` (20 when absent, 0 for none) is how many files are restored and
+compared after each backup. The secrets are stored with `pbs-mackup-run set-token` and
+`pbs-mackup-run set-key`, each reading standard input.
 
 ## How sizes are measured
 
@@ -52,12 +53,13 @@ opens with the last measurement and measures again when that is older than a day
 what the files take on disk, as Finder and `du` count them. Three things make the amount to
 back up smaller than the folder:
 
-- what is always left out (see `excludes` below), shown grey in the list;
+- what is always left out (see `excludes` above), shown grey in the list;
 - copies that share their storage with the original (APFS clones): they are read in full but
   the server stores such data once, so the header names their share;
 - files that are only in iCloud, which take no room on disk and are not backed up.
 
 Mounted volumes inside a backed-up folder are not counted and not backed up.
+
 ## The run tool
 
 `/Applications/PBSMackup.app/Contents/MacOS/pbs-mackup-run`, from a terminal:
@@ -67,15 +69,31 @@ pbs-mackup-run snapshots
 pbs-mackup-run list <snapshot> me.pxar [<folder>]
 pbs-mackup-run versions me.pxar <path>
 pbs-mackup-run restore <snapshot> me.pxar <path> <target folder> [keep-both|replace|skip]
-pbs-mackup-run index <snapshot> me.pxar      # the names in the snapshot as a JSON file in the cache; prints the file
-pbs-mackup-run mount <snapshot> me.pxar      # prints the folder; needs FUSE-T
-pbs-mackup-run unmount                              # everything mounted this way
-pbs-mackup-run sizes <folder>                       # measure a folder for the settings; prints the file
+pbs-mackup-run index <snapshot> me.pxar
+pbs-mackup-run mount <snapshot> me.pxar
+pbs-mackup-run unmount
+pbs-mackup-run sizes <folder>
 ```
+
+`index` writes the names in a snapshot to a JSON file in the cache, `mount` needs FUSE-T and
+prints the folder, `unmount` takes everything mounted this way.
 
 Without an argument it does one scheduled run, `--manual` one that ignores the interval and
 the battery, `--full` one that also reads every folder. `status` prints the state file,
 `set-token` and `set-key` store a secret from standard input in the Keychain.
+
+## When a run reads everything
+
+A run notes where the macOS change log (FSEvents) stands before it takes its snapshot. The
+next run reads the folders changed since and takes the others over from the previous backup.
+A folder that was moved or renamed is read with everything below it. Everything is read when:
+
+- there is no earlier backup to build on, or the newest one on the server isn't the one the
+  last run made;
+- the folders, the exclusions or the client changed;
+- macOS started the log over, or reports a gap or lost events;
+- the log doesn't answer within two minutes;
+- the run was started with `--full`.
 
 ## State file
 
@@ -130,16 +148,3 @@ A run record (`last`, `lastSuccess`, `history`):
 | `result.timeMachineExcluded` | entries left out because they are excluded from Time Machine |
 | `result.carriedFolders`, `readFolders`, `changeList` | folders taken over from the previous backup without being read, folders read, and whether the client used the list of changes (`used`, or `ignored: <reason>`) |
 | `result.warnings`, `error`, `clientDuration` | from the client |
-
-From the terminal, with the run tool in the app bundle:
-
-```sh
-pbs-mackup-run snapshots
-pbs-mackup-run list <snapshot> Downloads.pxar [<folder>]
-pbs-mackup-run versions Downloads.pxar <path>
-pbs-mackup-run restore <snapshot> Downloads.pxar <path> <target folder> [keep-both|replace|skip]
-pbs-mackup-run index <snapshot> Downloads.pxar      # the names in the snapshot as a JSON file in the cache; prints the file
-pbs-mackup-run mount <snapshot> Downloads.pxar      # prints the folder; needs FUSE-T
-pbs-mackup-run unmount                              # everything mounted this way
-pbs-mackup-run sizes <folder>                       # measure a folder for the settings; prints the file
-```

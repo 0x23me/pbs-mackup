@@ -14,12 +14,16 @@ runs on a Mac without Homebrew. It then needs the macOS version Homebrew built t
 which is why the app asks for macOS 26.
 
 ```sh
-just run              # build, sign, and start the menu bar app from .build
-just install          # the same, into /Applications, for daily use
-just backup           # one run from the terminal
-just test             # unit tests
-just test-snapshots   # plus the run tool's tests, which take and mount real APFS snapshots
+just run
+just install
+just backup
+just test
+just test-snapshots
 ```
+
+`run` builds, signs and starts the app from `.build`, `install` puts it into `/Applications`,
+`backup` does one run from the terminal. `test-snapshots` adds the run tool's tests, which
+take and mount real APFS snapshots.
 
 `just bundle` needs a "Developer ID Application" signing identity (`PBS_MACKUP_SIGN_IDENTITY`
 overrides it) and the client built in `../proxmox-backup-macos` with `just build` (which needs
