@@ -33,11 +33,11 @@ cask "pbs-mackup" do
 
   url "https://github.com/$repository/releases/download/v#{version}/PBSMackup-#{version}.zip"
   name "PBS Mackup"
-  desc "Backs up a Mac to a Proxmox Backup Server, in the manner of Time Machine"
+  desc "Home folder backups to a Proxmox Backup Server"
   homepage "https://github.com/$repository"
 
   depends_on arch: :arm64
-  depends_on macos: ">= :tahoe"
+  depends_on macos: :tahoe
 
   app "PBSMackup.app"
 
