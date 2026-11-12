@@ -47,6 +47,11 @@ stored configuration and the last measurement, and touches neither the Keychain 
 `PBS_MACKUP_RENDER_SOURCES` sets the backed-up folders for the picture, `PBS_MACKUP_RENDER_EXPAND` the
 folders to show open (paths below the first one, separated by colons).
 
+`PBSMackup --shot settings|timeline <file.png>` starts the app as usual, opens that window and
+saves a picture of it with its frame, which is how the pictures in the README are made (in a
+virtual machine with a made-up home folder). `PBS_MACKUP_RENDER_OPEN` names the folder the
+Backups window shows, such as `me.pxar/Documents`.
+
 ## Releasing
 
 ```sh

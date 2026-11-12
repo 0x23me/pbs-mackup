@@ -101,6 +101,12 @@ final class TimelineModel: ObservableObject {
         }
         // A changed selection loads its entries by itself, see the view.
         if selected == before { await loadEntries() }
+        if let place = ProcessInfo.processInfo.environment["PBS_MACKUP_RENDER_OPEN"], archive == nil {
+            var parts = place.split(separator: "/").map(String.init)
+            archive = parts.removeFirst()
+            path = parts
+            await loadEntries()
+        }
     }
 
     private var refreshed = Date.distantPast

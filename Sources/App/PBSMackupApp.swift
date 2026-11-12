@@ -21,7 +21,7 @@ struct PBSMackupApp: App {
         MenuBarExtra {
             StatusMenu(model: model)
         } label: {
-            Image(systemName: model.symbol)
+            MenuBarLabel(symbol: model.symbol)
         }
         .menuBarExtraStyle(.window)
 
@@ -33,6 +33,15 @@ struct PBSMackupApp: App {
             SettingsView()
         }
         .windowResizability(.contentMinSize)
+    }
+}
+
+private struct MenuBarLabel: View {
+    let symbol: String
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Image(systemName: symbol).onAppear { Shot.take(openWindow) }
     }
 }
 
@@ -57,7 +66,7 @@ final class StatusModel: ObservableObject {
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
             Client.unmount()
         }
-        registerAgent()
+        if Shot.request == nil { registerAgent() }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.reload() }
     }
 

@@ -22,6 +22,10 @@ this, restore. Not a Proxmox product; if something breaks, open an issue [here](
 Caches, the Trash, files that only exist in iCloud and anything excluded from Time Machine
 are left out.
 
+![The Backups window: snapshots on the left, the files of one folder on the right](docs/backups.png)
+
+![What to Back Up: the home folder largest first, with what is left out](docs/what-to-back-up.png)
+
 ## Install
 
 Apple silicon, macOS 26 or later, PBS 4.x.
