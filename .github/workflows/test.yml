@@ -1,0 +1,29 @@
+# Builds the package and runs the tests on every push to main and every pull request.
+# The tests need no client and no server: where they start pbs-mackup-run, it is the debug build
+# in a private folder with a stand-in client. The ones that take APFS snapshots stay off
+# (PBS_MACKUP_SNAPSHOT_TESTS), because they need Full Disk Access.
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # The same image as the release, so the tests run on the macOS version the app asks for.
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: swift build
+      - run: swift test

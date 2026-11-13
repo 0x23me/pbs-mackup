@@ -2,6 +2,10 @@
 # GitHub release vX.Y.Z and puts the cask into 0x23me/homebrew-tap. The tag has to match VERSION.
 # The message of an annotated tag becomes the release notes.
 #
+# Two jobs. `build` runs other people's code (Homebrew's packages, the client's crates) and holds
+# the signing secrets; it can only read this repository. `publish` runs none of that code and is
+# the only one that can write here. The actions are pinned to commits, not to tags that can move.
+#
 # Secrets:
 #   DEVELOPER_ID_CERTIFICATE           the Developer ID Application certificate with its key, .p12, base64
 #   DEVELOPER_ID_CERTIFICATE_PASSWORD  the password of that .p12
@@ -15,23 +19,28 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  release:
+  build:
     # Homebrew's OpenSSL and zstd are linked into the client, built for the runner's macOS;
     # this has to be the macOS version the app asks for (LSMinimumSystemVersion in bundle.sh).
     runs-on: macos-26
     timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      client: ${{ steps.version.outputs.client }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: pbs-mackup
+          persist-credentials: false
 
       - name: Check the tag against VERSION
         id: version
@@ -44,18 +53,33 @@ jobs:
           echo "client=$(tr -d '[:space:]' < client.commit)" >> "$GITHUB_OUTPUT"
 
       # bundle.sh takes the client from ../proxmox-backup-macos and checks it was built from client.commit.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: 0x23me/proxmox-backup-macos
           ref: ${{ steps.version.outputs.client }}
           path: proxmox-backup-macos
           submodules: recursive
+          persist-credentials: false
 
       - name: Install the client's build dependencies
         run: |
           brew install openssl@3 zstd pkgconf
           brew install --cask fuse-t
-          rustc --version
+
+      # OpenSSL and zstd come as Homebrew has them that day and are linked into the client, and
+      # the compilers are the runner's: what went into this release is written down with it.
+      - name: Note what the release is built with
+        run: |
+          mkdir -p pbs-mackup/dist
+          {
+            echo "macOS $(sw_vers -productVersion) ($(sw_vers -buildVersion))"
+            xcodebuild -version | paste -sd' ' -
+            swift --version 2>&1 | head -1
+            rustc --version
+            cargo --version
+            brew list --versions openssl@3 zstd pkgconf
+            brew list --cask --versions fuse-t
+          } | tee pbs-mackup/dist/built-with.txt
 
       - name: Build the client
         working-directory: proxmox-backup-macos
@@ -93,32 +117,54 @@ jobs:
           ./Scripts/release.sh "$VERSION"
           rm "$PBS_MACKUP_NOTARY_KEY"
 
-      - uses: actions/upload-artifact@v4
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
           path: pbs-mackup/dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
 
       - name: Publish the release
-        working-directory: pbs-mackup
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
-          CLIENT: ${{ steps.version.outputs.client }}
+          CLIENT: ${{ needs.build.outputs.client }}
         run: |
           git fetch --depth=1 origin "+refs/tags/v$VERSION:refs/tags/v$VERSION"
-          notes=""
-          [ "$(git cat-file -t "v$VERSION")" = tag ] && notes="$(git tag -l --format='%(contents)' "v$VERSION")"
-          notes="${notes:+$notes
-
-          }Client built from 0x23me/proxmox-backup-macos at ${CLIENT:0:7}."
-          gh release create "v$VERSION" --verify-tag --title "$VERSION" --notes "$notes" \
+          {
+            if [ "$(git cat-file -t "v$VERSION")" = tag ]; then
+              git tag -l --format='%(contents)' "v$VERSION"
+              echo
+            fi
+            echo "Client built from 0x23me/proxmox-backup-macos at ${CLIENT:0:7}."
+            echo
+            echo "Built with:"
+            sed 's/^/- /' dist/built-with.txt
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "v$VERSION" --verify-tag --title "$VERSION" --notes-file "$RUNNER_TEMP/notes.md" \
             "dist/PBSMackup-$VERSION.zip" "dist/PBSMackup-$VERSION.zip.sha256"
 
       - name: Update the Homebrew tap
-        working-directory: pbs-mackup
         env:
           TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           [ -n "$TAP_TOKEN" ] || { echo "::warning::no TAP_TOKEN; copy pbs-mackup.rb from the run's artifact into the tap"; exit 0; }
           tap="$RUNNER_TEMP/tap"
@@ -129,7 +175,3 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "pbs-mackup $VERSION"
           git push
-
-      - name: Remove the signing keychain
-        if: always()
-        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
