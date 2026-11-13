@@ -58,9 +58,7 @@ public enum ChangeLog {
         do { try FileManager.default.createDirectory(at: marker, withIntermediateDirectories: true) } catch {
             return .unusable("no marker folder: \(error.localizedDescription)")
         }
-        guard let markerPath = realpath(marker.path, nil).map({ pointer -> String in defer { free(pointer) }; return String(cString: pointer) }) else {
-            return .unusable("no marker folder")
-        }
+        guard let markerPath = realPath(marker.path) else { return .unusable("no marker folder") }
 
         let collector = Collector(roots: roots, marker: markerPath)
         var context = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(collector).toOpaque(),
@@ -81,7 +79,15 @@ public enum ChangeLog {
             FSEventStreamInvalidate(stream); FSEventStreamRelease(stream)
             return .unusable("the change log cannot be read")
         }
-        defer { FSEventStreamStop(stream); FSEventStreamInvalidate(stream); FSEventStreamRelease(stream) }
+        defer {
+            FSEventStreamStop(stream); FSEventStreamInvalidate(stream)
+            // The stream only borrows the collector, and Swift may let go of it after its last
+            // use below. It is held until the stream has stopped and a report that was on its
+            // way has been taken.
+            queue.sync {}
+            withExtendedLifetime(collector) {}
+            FSEventStreamRelease(stream)
+        }
 
         let deadline = Date().addingTimeInterval(timeout)
         func wait(until done: () -> Bool) -> Bool {

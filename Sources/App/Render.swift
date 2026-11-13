@@ -1,6 +1,10 @@
 import AppKit
 import SwiftUI
 
+// The picture modes are for development and only in a debug build (`swift build`). The app as it
+// is bundled and released has none of this.
+#if DEBUG
+
 /// For development: `PBSMackup --render settings <file.png> [backup|server|key]` draws a window's
 /// content into an image and exits, without the menu bar item and without touching the
 /// Keychain or the launchd job. The backed-up folders can be set with PBS_MACKUP_RENDER_SOURCES.
@@ -67,3 +71,12 @@ enum Shot {
             .takeRetainedValue()
     }
 }
+
+#else
+
+/// The settings ask whether a picture is being drawn, which it never is in this build.
+enum Render {
+    static let active = false
+}
+
+#endif

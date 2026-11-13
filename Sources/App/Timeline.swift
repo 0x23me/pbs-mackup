@@ -101,12 +101,14 @@ final class TimelineModel: ObservableObject {
         }
         // A changed selection loads its entries by itself, see the view.
         if selected == before { await loadEntries() }
+        #if DEBUG
         if let place = ProcessInfo.processInfo.environment["PBS_MACKUP_RENDER_OPEN"], archive == nil {
             var parts = place.split(separator: "/").map(String.init)
             archive = parts.removeFirst()
             path = parts
             await loadEntries()
         }
+        #endif
     }
 
     private var refreshed = Date.distantPast
@@ -149,14 +151,15 @@ final class TimelineModel: ObservableObject {
                     return
                 } catch {
                     guard asked == listing else { return }
-                    guard !path.isEmpty, "\(error)".contains("no such path") else { throw error }
+                    guard !path.isEmpty, Client.isMissingPath(error) else { throw error }
                     path.removeLast()
                 }
             }
         }
     }
 
-    /// A folder is entered; a file is fetched from the backup into the cache and opened, to look at.
+    /// A folder is entered; a file is fetched from the backup into the cache and opened, to look
+    /// at. The copy is removed when the window closes, see `TimelineView.takeDown`.
     func open(_ row: Row) async {
         guard row.entry.isDirectory else {
             guard let snapshot, let archive = row.archive else { return }
@@ -164,7 +167,8 @@ final class TimelineModel: ObservableObject {
                 message = "Fetching \(row.name)…"
                 let folder = Paths.preview.appendingPathComponent(UUID().uuidString)
                 if let file = try await restore(row.path, from: snapshot.name, archive: archive, into: folder) {
-                    message = "\(row.name) as of \(snapshot.time.formatted(date: .abbreviated, time: .shortened)), a copy to look at."
+                    message = "\(row.name) as of \(snapshot.time.formatted(date: .abbreviated, time: .shortened)), a copy to look at. "
+                        + "It goes away when this window closes."
                     NSWorkspace.shared.open(file)
                 }
             }
@@ -187,7 +191,8 @@ final class TimelineModel: ObservableObject {
 
     // MARK: - Searching
 
-    /// The names in the snapshots searched so far; a few thousand entries each, so only a few are kept.
+    /// The names in the snapshot that was searched last. A home folder has a few million of
+    /// them, which is some hundred megabytes here, so only that one is kept.
     private var indexes: [Client.Snapshot.ID: SnapshotIndex] = [:]
     private var search: Task<Void, Never>?
 
@@ -232,8 +237,7 @@ final class TimelineModel: ObservableObject {
         message = "Reading the names in this backup…"
         let file = URL(fileURLWithPath: try await RunTool.decode(Indexed.self, ["index", snapshot.name] + snapshot.archives).index)
         let index = try await Task.detached { try SnapshotIndex(contentsOf: file) }.value
-        if indexes.count >= 3 { indexes.removeAll() }
-        indexes[snapshot.id] = index
+        indexes = [snapshot.id: index]
         return index
     }
 
@@ -247,9 +251,11 @@ final class TimelineModel: ObservableObject {
     }
 
     /// The folder an item came from on this Mac, if its top folder is still being backed up.
+    /// A run names an archive after the folder a source really is, which for a link is the
+    /// folder it points to.
     private func originalFolder(of row: Row) -> URL? {
         guard let archive = row.archive, let source = (try? Config.load())?.sources
-            .map({ ($0 as NSString).expandingTildeInPath }).first(where: { Config.archiveName(for: $0) == archive }) else { return nil }
+            .map(Config.realPath).first(where: { Config.archiveName(for: $0) == archive }) else { return nil }
         return row.folder.reduce(URL(fileURLWithPath: source)) { $0.appendingPathComponent($1) }
     }
 
@@ -383,7 +389,20 @@ final class TimelineModel: ObservableObject {
 }
 
 struct TimelineView: View {
+    /// The window's title, which is also how the view knows its own window among the app's.
+    static let title = "Backups"
     @StateObject private var model = TimelineModel()
+
+    private static func isOwn(_ note: Notification) -> Bool { (note.object as? NSWindow)?.title == title }
+
+    /// What Open in Finder mounted and the files opened to look at live as long as this window
+    /// (and the app, see StatusModel).
+    private static func takeDown() {
+        DispatchQueue.global().async {
+            Client.unmount()
+            Paths.emptyPreview()
+        }
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -502,32 +521,27 @@ struct TimelineView: View {
             .frame(width: 620, height: 360)
         }
         .task { await model.loadSnapshots() }
-        // What Open in Finder mounted lives as long as this window (and the app, see StatusModel).
-        .onDisappear { DispatchQueue.global().async { Client.unmount() } }
+        .onDisappear { TimelineView.takeDown() }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
-            if (note.object as? NSWindow)?.title == "Backups" { DispatchQueue.global().async { Client.unmount() } }
+            if TimelineView.isOwn(note) { TimelineView.takeDown() }
         }
         .onChange(of: model.selected) {
             Task { await model.loadEntries() }
             model.runSearch()      // the same words, in the other backup
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
-            if (note.object as? NSWindow)?.title == "Backups" { Task { await model.refreshSnapshots() } }
+            if TimelineView.isOwn(note) { Task { await model.refreshSnapshots() } }
         }
     }
 }
 
-/// Command-F puts the cursor into the search field, where the system can do that.
+/// Command-F puts the cursor into the search field.
 private struct FindShortcut: ViewModifier {
     @FocusState private var focused: Bool
 
     func body(content: Content) -> some View {
-        if #available(macOS 15, *) {
-            content.searchFocused($focused).background {
-                Button("Find") { focused = true }.keyboardShortcut("f", modifiers: .command).opacity(0).frame(width: 0, height: 0)
-            }
-        } else {
-            content
+        content.searchFocused($focused).background {
+            Button("Find") { focused = true }.keyboardShortcut("f", modifiers: .command).opacity(0).frame(width: 0, height: 0)
         }
     }
 }

@@ -90,12 +90,9 @@ import Testing
     #expect(State.load(from: file) == state)
 }
 
-@Test func batteryIsReadFromPmset() {
-    let onBattery = "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=1234)\t15%; discharging; 1:02 remaining present: true"
-    #expect(Power.parse(onBattery)?.percent == 15)
-    #expect(Power.parse(onBattery)?.onAC == false)
-    #expect(Power.parse("Now drawing from 'AC Power'\n -InternalBattery-0 (id=1234)\t100%; charged; 0:00 remaining")?.onAC == true)
-    #expect(Power.parse("Now drawing from 'AC Power'") == nil)
+@Test func theBatteryIsAskedOfTheSystem() {
+    // Whatever Mac this runs on: a charge between empty and full, or no battery at all.
+    if let battery = Power.battery() { #expect((0...100).contains(battery.percent)) }
 }
 
 @Test func folderArchivesAreFoundAmongSnapshotFiles() {
@@ -400,10 +397,12 @@ private func record(_ outcome: Outcome, at start: Date, reason: String? = nil) -
 
 @Test func aScheduledRunWaitsForTheInterval() {
     let last = Date(timeIntervalSince1970: 1_800_000_000)
-    #expect(Runner.isDue(last: nil, intervalMinutes: 60, now: last))
-    #expect(!Runner.isDue(last: last, intervalMinutes: 60, now: last.addingTimeInterval(55 * 60)))
-    #expect(Runner.isDue(last: last, intervalMinutes: 60, now: last.addingTimeInterval(60 * 60 - 10)))     // launchd's timer is not exact
-    #expect(Runner.isDue(last: last, intervalMinutes: 15, now: last.addingTimeInterval(15 * 60)))
+    var state = State()
+    #expect(Runner.isDue(state, intervalMinutes: 60, now: last))
+    state.finish(record(.success, at: last))
+    #expect(!Runner.isDue(state, intervalMinutes: 60, now: last.addingTimeInterval(55 * 60)))
+    #expect(Runner.isDue(state, intervalMinutes: 60, now: last.addingTimeInterval(60 * 60 - 10)))     // launchd's timer is not exact
+    #expect(Runner.isDue(state, intervalMinutes: 15, now: last.addingTimeInterval(15 * 60)))
     #expect(Config(repository: "", namespace: "", backupID: "", sources: []).interval == 60)
 }
 

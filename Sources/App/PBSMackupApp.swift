@@ -1,4 +1,5 @@
 import AppKit
+import os
 import PBSMackupKit
 import ServiceManagement
 import SwiftUI
@@ -7,9 +8,11 @@ import UserNotifications
 @main
 enum Main {
     static func main() {
+        #if DEBUG
         if let at = CommandLine.arguments.firstIndex(of: "--render") {
             Render.run(Array(CommandLine.arguments[(at + 1)...]))
         }
+        #endif
         PBSMackupApp.main()
     }
 }
@@ -24,8 +27,11 @@ struct PBSMackupApp: App {
             MenuBarLabel(symbol: model.symbol)
         }
         .menuBarExtraStyle(.window)
+        // The panel grows with its content and would not shrink again: after a backup it kept the
+        // height of the running state and showed the shorter menu in the middle of it.
+        .windowResizability(.contentSize)
 
-        Window("Backups", id: "timeline") {
+        Window(TimelineView.title, id: "timeline") {
             TimelineView()
         }
 
@@ -41,40 +47,79 @@ private struct MenuBarLabel: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
+        #if DEBUG
         Image(systemName: symbol).onAppear { Shot.take(openWindow) }
+        #else
+        Image(systemName: symbol)
+        #endif
     }
 }
 
-/// Reads the state file once a second and offers the few actions the menu has.
+/// Reads the state file when it changes and offers the few actions the menu has.
 final class StatusModel: ObservableObject {
     enum Status { case notSetUp, idle, running, waiting, paused, failing }
 
     @Published var state = State.load()
+    /// Whether the run the state file names is still going, as of the last `reload`.
+    @Published var live = false
+    @Published var paused = Pause.isOn
     @Published var configured = FileManager.default.fileExists(atPath: Paths.config.path)
+    /// How often a backup is made, in minutes: read again when the configuration was written.
+    @Published var interval = 60
+    private var configWritten: Date?
     @Published var agent = ""
     @Published var fullDiskAccess = FullDiskAccess.granted
+    private var watcher: FolderWatcher?
     private var timer: Timer?
 
     init() {
-        // Files opened from a backup to look at are copies; a restored folder may carry an ACL
-        // that forbids deleting it, so that goes first.
-        tool("/bin/chmod", ["-R", "-N", Paths.preview.path])
-        try? FileManager.default.removeItem(at: Paths.preview)
-        // Backups a previous run of the app left open in Finder, e.g. after a crash; and on
-        // quitting, the ones this run opened.
+        // Files opened from a backup to look at and backups opened in Finder that a previous run
+        // of the app left behind, e.g. after a crash; and on quitting, the ones of this run.
+        Paths.emptyPreview()
         DispatchQueue.global().async { Client.unmount() }
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
             Client.unmount()
+            Paths.emptyPreview()
         }
-        if Shot.request == nil { registerAgent() }
-        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.reload() }
+        #if DEBUG
+        if Shot.request == nil { registerJobs() }
+        #else
+        registerJobs()
+        // The token and the key of a version before 0.2 move to where this version keeps them;
+        // macOS asks for the login password for each. Nothing happens when there are none.
+        Task { [weak self] in
+            _ = try? await RunTool.call(["migrate"])
+            await MainActor.run { self?.reload() }
+        }
+        #endif
+        // The state file, the configuration and the pause file are all written into the support
+        // folder, so a change there says when to read them again. The timer is for what no such
+        // change announces: Full Disk Access switched on or off, three days gone by without a
+        // backup, a run tool that died and left its record in the state file, and a
+        // configuration that an editor rewrote in place.
+        watcher = FolderWatcher(Paths.support) { [weak self] in self?.reload() }
+        timer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in self?.reload() }
+        timer?.tolerance = 10
+        reload()
     }
 
     func reload() {
         let fresh = State.load()
         if fresh != state { state = fresh }
+        let going = fresh.running?.isLive == true
+        if going != live { live = going }
+        let pause = Pause.isOn
+        if pause != paused { paused = pause }
         let hasConfig = FileManager.default.fileExists(atPath: Paths.config.path)
         if hasConfig != configured { configured = hasConfig }
+        // The interval is read when the configuration was written, not on every redraw of the menu.
+        let file = Paths.config.resolvingSymlinksInPath().path
+        let written = (try? FileManager.default.attributesOfItem(atPath: file))?[.modificationDate] as? Date
+        if written != configWritten {
+            configWritten = written
+            let minutes = (try? Config.load())?.interval ?? 60
+            if minutes != interval { interval = minutes }
+        }
         let access = FullDiskAccess.granted
         if access != fullDiskAccess { fullDiskAccess = access }
         notify()
@@ -99,9 +144,9 @@ final class StatusModel: ObservableObject {
 
     var status: Status {
         if !configured { return .notSetUp }
-        if let running = state.running, kill(running.pid, 0) == 0 { return .running }
+        if live { return .running }
         if state.last?.outcome == .failed { return .failing }
-        if state.paused { return .paused }
+        if paused { return .paused }
         if state.last?.outcome == .skipped { return .waiting }
         return .idle
     }
@@ -117,50 +162,65 @@ final class StatusModel: ObservableObject {
         }
     }
 
-    /// When the next backup is due: one interval after the last run began. launchd looks
-    /// every five minutes, so it starts within five minutes of that.
-    var nextRun: Date {
-        let interval = (try? Config.load())?.interval ?? 60
-        guard let last = state.last?.start else { return Date() }
-        return max(Date(), last.addingTimeInterval(Double(interval * 60)))
-    }
+    /// When the next backup is due, by the rule the run tool goes by. launchd looks every five
+    /// minutes, so it starts within five minutes of that.
+    var nextRun: Date { max(Date(), state.nextRun(intervalMinutes: interval)) }
 
     // MARK: Actions
 
-    /// The job that starts the run tool lives in the app bundle and is registered with launchd from here.
-    func registerAgent() {
-        let service = SMAppService.agent(plistName: "\(agentLabel).plist")
-        // launchd finds the run tool through the app that registered the job. After the app
-        // moved (from the build folder to /Applications, say) the job is registered again from
-        // where it is now.
-        // The same goes for a new version of the app whose job is described differently.
+    /// The jobs that start the run tool live in the app bundle and are registered with launchd
+    /// from here: one for the scheduled backups, one for a backup the owner asks for, and the
+    /// helper the app talks to (`Identity.jobs`).
+    func registerJobs() {
+        // launchd finds the run tool through the app that registered the jobs, and starts only
+        // the run tool it found then. After the app moved (from the build folder to
+        // /Applications, say) or was replaced by another version or another build of itself,
+        // the jobs are registered again from what is there now.
+        let plists = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LaunchAgents")
+        let built = Bundle.main.executableURL.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.modificationDate] as? Date }
+        var registered = Bundle.main.bundlePath + "\n" + "\(built?.timeIntervalSince1970 ?? 0)"
+        for job in Identity.jobs {
+            registered += "\n" + ((try? String(contentsOf: plists.appendingPathComponent("\(job).plist"), encoding: .utf8)) ?? "")
+        }
         let defaults = UserDefaults.standard
-        let plist = Bundle.main.bundleURL.appendingPathComponent("Contents/Library/LaunchAgents/\(agentLabel).plist")
-        let registered = Bundle.main.bundlePath + "\n" + ((try? String(contentsOf: plist, encoding: .utf8)) ?? "")
-        if service.status == .enabled, defaults.string(forKey: "registeredJob") != registered {
-            try? service.unregister()
-        }
+        let changed = defaults.string(forKey: "registeredJob") != registered
         defaults.set(registered, forKey: "registeredJob")
-        if service.status != .enabled {
-            do { try service.register() } catch { agent = "The backup job could not be registered: \(error.localizedDescription)" }
+        // The job of a version before 0.2, which launchd no longer starts; see `Identity.legacyLabel`.
+        // Its description is still in the bundle for this alone.
+        let old = SMAppService.agent(plistName: "\(Identity.legacyLabel).plist")
+        if old.status == .enabled || old.status == .requiresApproval {
+            let log = Logger(subsystem: Identity.bundleID, category: "jobs")
+            do { try old.unregister(); log.notice("the job of an earlier version is unregistered") }
+            catch { log.notice("the job of an earlier version: \(error.localizedDescription, privacy: .public)") }
         }
-        if service.status == .requiresApproval { agent = "Allow PBS Mackup under Login Items in System Settings." }
+        for job in Identity.jobs {
+            let service = SMAppService.agent(plistName: "\(job).plist")
+            if service.status == .enabled, changed { try? service.unregister() }
+            if changed || service.status != .enabled {
+                // An error only counts when the job is not there afterwards.
+                do { try service.register() } catch {
+                    if service.status != .enabled { agent = "The backup job could not be registered: \(error.localizedDescription)" }
+                }
+            }
+            if service.status == .requiresApproval { agent = "Allow PBS Mackup under Login Items in System Settings." }
+        }
     }
 
+    /// Starts the job for a backup by hand. It is none of launchd's background jobs, so the
+    /// backup runs as fast as the Mac allows.
     func backUpNow() {
-        try? Paths.createFolders()
-        FileManager.default.createFile(atPath: Paths.manualRequest.path, contents: nil)
-        tool("/bin/launchctl", ["kickstart", "gui/\(getuid())/\(agentLabel)"])
+        tool("/bin/launchctl", ["kickstart", "gui/\(getuid())/\(Identity.manualLabel)"])
     }
 
+    /// Only a run that is still going is signalled: the process id of one that ended without
+    /// clearing its record may be another program's by now.
     func cancel() {
-        if let pid = state.running?.pid { kill(pid, SIGTERM) }
+        if let running = state.running, running.isLive { kill(running.pid, SIGTERM) }
     }
 
+    /// The pause is a file of its own, see `Pause`; the state file is the run tool's to write.
     func togglePause() {
-        var fresh = State.load()
-        fresh.paused.toggle()
-        try? fresh.save()
+        try? Pause.set(!Pause.isOn)
         reload()
     }
 
@@ -169,7 +229,7 @@ final class StatusModel: ObservableObject {
         else { NSWorkspace.shared.open(Paths.logs) }
     }
 
-    func openFullDiskAccess() {
+    static func openFullDiskAccess() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
     }
 }
@@ -182,7 +242,10 @@ struct StatusMenu: View {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(headline).font(.title3.bold())
-                ForEach(details, id: \.self) { Text($0).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                ForEach(details, id: \.text) { line in
+                    Text(line.text).font(.callout).foregroundStyle(.secondary)
+                        .lineLimit(line.oneLine ? 1 : nil).truncationMode(.middle).fixedSize(horizontal: false, vertical: true)
+                }
                 if model.status == .running {
                     // A bar that fills when an earlier backup tells how much there is; moving stripes on a first one.
                     if let progress = model.state.running?.progress, let done = progress.bytesProcessed,
@@ -199,7 +262,7 @@ struct StatusMenu: View {
                 if !model.agent.isEmpty { MenuNote(text: model.agent) }
                 if !model.fullDiskAccess {
                     MenuNote(text: "Full Disk Access is off, so backups read the folders as they are, not a frozen snapshot of them.")
-                    MenuRow(title: "Open Full Disk Access Settings", symbol: "lock.open", opens: true) { model.openFullDiskAccess() }
+                    MenuRow(title: "Open Full Disk Access Settings", symbol: "lock.open", opens: true) { StatusModel.openFullDiskAccess() }
                 }
                 if model.status == .running {
                     MenuRow(title: "Cancel Backup", symbol: "xmark", trailing: started) { model.cancel() }
@@ -207,7 +270,7 @@ struct StatusMenu: View {
                     MenuRow(title: "Back Up Now", symbol: "arrow.clockwise", trailing: nextBackup.map { "Next at \($0)" } ?? "") { model.backUpNow() }
                         .disabled(model.status == .notSetUp)
                 }
-                if model.state.paused {
+                if model.paused {
                     MenuRow(title: "Resume Automatic Backups", symbol: "play.fill", trailing: "Paused") { model.togglePause() }
                 } else {
                     MenuRow(title: "Pause Automatic Backups", symbol: "pause.fill") { model.togglePause() }
@@ -226,6 +289,8 @@ struct StatusMenu: View {
             .padding(6)
         }
         .frame(width: 310)
+        // What the timer looks at once a minute is looked at when the menu opens, too.
+        .onAppear { model.reload() }
     }
 
     private var headline: String {
@@ -239,8 +304,11 @@ struct StatusMenu: View {
         }
     }
 
-    private var details: [String] {
+    /// The grey lines under the headline. They wrap, all but the name of the file being read:
+    /// that changes every second, and the panel would change its height with it.
+    private var details: [(text: String, oneLine: Bool)] {
         var lines: [String] = []
+        var file: Int?
         let state = model.state
         switch model.status {
         case .notSetUp:
@@ -250,9 +318,12 @@ struct StatusMenu: View {
                 if let processed = progress.processed, let uploaded = progress.uploaded {
                     lines.append("\(processed) processed, \(uploaded) uploaded" + (progress.elapsed.map { " in \($0)" } ?? ""))
                     if let speed = progress.speed { lines.append("Uploading at \(speed)") }
-                    if let path = progress.path, !path.isEmpty { lines.append((path as NSString).lastPathComponent) }
+                    if let path = progress.path, !path.isEmpty {
+                        file = lines.count
+                        lines.append((path as NSString).lastPathComponent)
+                    }
                 } else {
-                    lines.append(progress.step.prefix(1).uppercased() + progress.step.dropFirst() + "…")
+                    lines.append(progress.step.rawValue.prefix(1).uppercased() + progress.step.rawValue.dropFirst() + "…")
                 }
             }
         case .waiting, .failing:
@@ -269,12 +340,12 @@ struct StatusMenu: View {
             lines.append("No backup yet.")
         }
         if let nextBackup { lines.append("Next backup: \(nextBackup)") }
-        return lines
+        return lines.enumerated().map { ($1, $0 == file) }
     }
 
     /// The time of the next scheduled run, when there is one to announce.
     private var nextBackup: String? {
-        guard model.status != .running && model.status != .notSetUp && !model.state.paused else { return nil }
+        guard model.status != .running && model.status != .notSetUp && !model.paused else { return nil }
         let next = model.nextRun
         return next.timeIntervalSinceNow < 60 ? "within five minutes" : "about \(next.formatted(date: .omitted, time: .shortened))"
     }

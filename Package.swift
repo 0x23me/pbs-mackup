@@ -7,7 +7,8 @@ import PackageDescription
 //   PBSMackup       the menu bar app; reads the state file the run tool writes
 let package = Package(
     name: "pbs-mackup",
-    platforms: [.macOS(.v14)],
+    // The same as LSMinimumSystemVersion in Scripts/bundle.sh.
+    platforms: [.macOS("26.0")],
     products: [
         .executable(name: "PBSMackup", targets: ["App"]),
         .executable(name: "pbs-mackup-run", targets: ["RunTool"]),

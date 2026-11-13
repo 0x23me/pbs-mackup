@@ -33,10 +33,7 @@ public enum LocalSnapshot {
         let on = withUnsafePointer(to: &info.f_mntonname) {
             $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
         }
-        // realpath, not resolvingSymlinksInPath: that one drops /private from /private/var.
-        guard let real = realpath(mountPoint.path, nil) else { return false }
-        defer { free(real) }
-        return on == String(cString: real)
+        return on == realPath(mountPoint.path)
     }
 
     public static func unmount(_ mountPoint: URL) {

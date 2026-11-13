@@ -105,7 +105,8 @@ struct WhatToBackUpView: View {
                     Button("Add Whole Home Folder") { model.add(source: NSHomeDirectory()) }
                 }
                 Spacer()
-                Text(model.message).font(.callout).foregroundStyle(.red).lineLimit(2)
+                // Room for why a folder was not added.
+                Text(model.message).font(.callout).foregroundStyle(.red).lineLimit(4).fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -160,6 +161,11 @@ struct WhatToBackUpView: View {
     private var rules: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Left out by you").font(.headline)
+            if model.sources.count > 1 {
+                // The client gets one list for all folders, and a path in it counts from the top of each.
+                Text("A path left out of one backed-up folder is left out of the others too.")
+                    .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
             ScrollView {
                 VStack(spacing: 0) {
                     if model.rules.isEmpty {

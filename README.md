@@ -40,16 +40,19 @@ Or take the zip from [releases](../../releases) and move the app to Applications
 
 ## On the server
 
-A namespace for the Mac and a token that can only add backups there. On the PBS host, with
-your datastore's name for `store`:
+A namespace for the Mac, a user of its own, and a token of that user that can only add backups
+there. On the PBS host, with your datastore's name for `store`:
 
 ```sh
 proxmox-backup-debug api create /admin/datastore/store/namespace --name mac
-proxmox-backup-manager user generate-token root@pam macbackup
-proxmox-backup-manager acl update /datastore/store/mac DatastoreBackup --auth-id 'root@pam!macbackup'
+proxmox-backup-manager user create mac@pbs
+proxmox-backup-manager user generate-token mac@pbs backup
+proxmox-backup-manager acl update /datastore/store/mac DatastoreBackup --auth-id 'mac@pbs'
+proxmox-backup-manager acl update /datastore/store/mac DatastoreBackup --auth-id 'mac@pbs!backup'
 ```
 
-The second command prints the token secret, once. `DatastoreBackup` can't delete or prune, so
+The third command prints the token secret, once. The user has no password and gets the role
+too, because a token never may more than its user. `DatastoreBackup` can't delete or prune, so
 thinning out old snapshots is the server's job:
 
 ```sh
@@ -65,20 +68,35 @@ A prune job without a namespace covers every namespace, this one included.
 
 The app lives in the menu bar. Settings has three tabs:
 
-1. **Server.** Repository (`root@pam!macbackup@pbs.example.net:store`), namespace, a name
-   for this Mac, the token secret. A certificate that isn't publicly trusted shows its
-   fingerprint to compare with the server's.
-2. **Encryption Key.** Make a key, then save the recovery file or print the paper key and
-   keep it somewhere that isn't this Mac. Without the key or that copy nobody can read the
-   backups, you included. After a reinstall, import the copy.
+1. **Server.** Repository (`mac@pbs!backup@pbs.example.net:store`), namespace, a name
+   for this Mac, the token secret. A certificate the client can't check against the roots
+   macOS ships shows its fingerprint to compare with the server's. That includes one from your
+   own CA, even when your Keychain trusts it. Nothing is saved until the server has accepted
+   the connection.
+2. **Encryption Key.** Make a key, then save the recovery file or print the paper key and keep
+   it somewhere that isn't this Mac. Without the key or that copy nobody can read the backups,
+   you included. After a reinstall, import the copy. Saving the recovery file, printing the
+   paper key and replacing the key ask for Touch ID or your password. A key file that has a
+   passphrase can't be imported; take it off a copy first with `proxmox-backup-client key
+   change-passphrase <copy> --kdf none`.
 3. **What to Back Up.** Starts with your whole home folder. Untick folders, take the
    suggestions (`node_modules`, build folders, caches), or add a name (`*.iso`) or a path.
-   Pick how often to back up.
+   Pick how often to back up. A folder has to be on the Mac's own disk, and two folders of the
+   same name can't both be backed up. With more than one folder, a path you untick in one is
+   left out of the others too.
 
 Then switch on Full Disk Access for PBS Mackup in System Settings. Without it the app can't
-mount a snapshot of the disk and reads the live folders instead.
+mount a snapshot of the disk and reads the live folders instead, and such a run stops when a
+file changes while it is read, which in a whole home folder is likely.
 
-The token secret and the key are kept in your login Keychain.
+The token secret and the key are kept in your login Keychain; [what is protected](#what-is-protected)
+says from whom.
+
+### Coming from 0.1
+
+0.2 keeps the token and the key in Keychain items of its own, which the run tool of the earlier
+versions cannot read. When it first starts, macOS asks for your login password, once for each,
+to move them there. Back Up Now, the Backups window and the settings work as before.
 
 ## Getting things back
 
@@ -87,14 +105,18 @@ folder you pick or to where it was; if something is already there you are asked 
 Right-click a file for its versions. Command-F searches the names of the whole snapshot.
 
 Open in Finder needs FUSE-T (`brew install --cask fuse-t`). A mounted backup shows no Mac
-metadata, so restore files rather than copying them out.
+metadata, so restore files rather than copying them out. While it is open, any program can read
+it, and FUSE-T serves it through an NFS server on this Mac that this app has not looked into. It
+is refused when FUSE-T's files in `/usr/local` or a folder above them can be changed by anyone
+but root, as on an Intel Mac where Homebrew owns `/usr/local/lib`: what is loaded from there
+runs with the token and the key.
 
 ### Without the Mac
 
 On Linux, with the official `proxmox-backup-client` 4.x and the recovery copy of the key:
 
 ```sh
-export PBS_REPOSITORY='root@pam!macbackup@pbs.example.net:store'
+export PBS_REPOSITORY='mac@pbs!backup@pbs.example.net:store'
 proxmox-backup-client snapshot list --ns mac
 proxmox-backup-client restore host/my-mac/2026-11-12T08:00:00Z me.pxar /restore/target \
   --ns mac --keyfile key.json --ignore-xattrs true
@@ -120,10 +142,12 @@ yet, so do it by hand:
 
 ```sh
 brew uninstall --cask pbs-mackup
-rm -rf ~/Library/Application\ Support/pbs-mackup ~/Library/Caches/pbs-mackup
+rm -rf ~/Library/Application\ Support/pbs-mackup ~/Library/Caches/pbs-mackup \
+  ~/Library/Group\ Containers/*.me.0x23.pbs-mackup
 ```
 
-The key and the token stay in the login Keychain, the backups on the server.
+The key and the token stay in the login Keychain (under `me.0x23.pbs-mackup.tool`), the
+backups on the server.
 
 ## What's inside
 
@@ -134,6 +158,35 @@ of the Proxmox Backup client plus what this app needed. The commit is in
 
 Files and settings: [docs/reference.md](docs/reference.md). Building it:
 [docs/building.md](docs/building.md).
+
+## What is protected
+
+- From the server and the network: everything is encrypted on the Mac with a key the server
+  never sees, file names included. The token can add backups and fetch this Mac's own, still
+  encrypted; it can't delete or prune.
+- The backups and the key, from other programs on the Mac: macOS hands the token and the key
+  only to the app's run tool, and the run tool takes requests only from the app, which macOS
+  checks by its signature. Started by anything else, at a terminal say, it asks for Touch ID or
+  your password before it lists or restores anything or changes the settings, the token or the
+  key. It gives the key to nothing but the client it came with, checked by its signature too,
+  and before it exports or replaces the key it asks even when it is the app that wants it.
+- What is backed up and where to, from other programs: a run goes only by settings the app
+  saved and by a key the app stored. It notes both in a folder where macOS asks you before it
+  lets another developer's program in. When `config.json` or the key in the Keychain is not what
+  was noted, nothing is backed up or read, and the menu says why.
+- The frozen snapshot, which holds a copy of Mail, Messages and everything else in your home
+  folder, and the files a run restores to check them: both are in that same folder.
+- Not from a program that runs as you and only wants to be in the way. It can pause backups,
+  delete the token and the key from the Keychain, or rewrite the state file. Backups then stop
+  or fail and the menu says so; nothing gets out.
+- Not what you are looking at: a file opened from the Backups window is an ordinary copy in the
+  cache until the window closes, and a backup opened in Finder can be read by any program
+  while it is open.
+- Not from the versions before 0.2 as long as their Keychain items exist: those handed the key
+  to whoever asked. 0.2 moves the items out of their reach when it first starts. If an earlier
+  version ran on a Mac you don't trust, make a new key.
+- Not from anything that has Full Disk Access or is root, and not from a program you let in
+  when macOS asks.
 
 ## State of things
 

@@ -3,7 +3,9 @@ import Foundation
 /// Decides when the owner has to be told that backups are not happening: after three failed
 /// runs in a row, and after three days without a successful one. Each is said once, until a
 /// run has succeeded again. Skipped runs are not failures, so a Mac away from the server for
-/// a weekend stays quiet.
+/// a weekend stays quiet. A failed run is tried again before the interval is over, with a
+/// longer wait each time (`State.nextRun`), so three in a row are most of an hour of failing
+/// unless backups are made more often than that.
 public struct Notices: Codable, Equatable {
     public struct Notice: Equatable {
         public let title: String

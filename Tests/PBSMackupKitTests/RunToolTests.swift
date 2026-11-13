@@ -14,6 +14,7 @@ private let token = "TOKEN-SECRET-7f3a", key = "KEY-SECRET-91bc"
 /// what it does.
 private let stub = #"""
     #include <copyfile.h>
+    #include <dirent.h>
     #include <fcntl.h>
     #include <libgen.h>
     #include <stdio.h>
@@ -30,11 +31,27 @@ private let stub = #"""
         if (file) fclose(file);
     }
 
+    /* Whether the folder has an entry of exactly this name. The client compares names byte by
+       byte; the file system also finds a name whose accents are written another way. */
+    static int holds(const char *folder, const char *name) {
+        DIR *entries = opendir(folder);
+        struct dirent *entry;
+        int found = 0;
+        while (entries && (entry = readdir(entries))) if (!strcmp(entry->d_name, name)) found = 1;
+        if (entries) closedir(entries);
+        return found;
+    }
+
     int main(int argc, char **argv) {
         const char *home = getenv("PBS_MACKUP_HOME"), *mode = getenv("PBS_MACKUP_STUB");
         char path[4096], buffer[4096];
-        if (argc > 2 && !strcmp(argv[2], "--help")) { puts("backup ... [--changed-dirs <file>]"); return 255; }
+        ssize_t count;
         while (read(0, buffer, sizeof buffer) > 0) {}        /* the key, on standard input */
+        /* The token, on descriptor 3; kept to look at. */
+        snprintf(path, sizeof path, "%s/client-token", home);
+        int token = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        while ((count = read(3, buffer, sizeof buffer)) > 0) write(token, buffer, count);
+        close(token);
 
         /* catalog extract <snapshot> <archive> <path> <target>: a copy of the source file, with
            all metadata; PBS_MACKUP_STUB_EXTRACT=alter changes its first byte and nothing else. */
@@ -42,11 +59,17 @@ private let stub = #"""
             char restored[4096];
             const char *alter = getenv("PBS_MACKUP_STUB_EXTRACT");
             struct stat info;
-            snprintf(path, sizeof path, "%s/Source/%s", home, argv[5]);
-            snprintf(restored, sizeof restored, "%s/%s", argv[6], basename(argv[5]));
+            /* The path comes with a slash in front (Client.pathArgument), which the client drops. */
+            char *item = argv[5];
+            while (*item == '/') item++;
+            snprintf(path, sizeof path, "%s/Source/%s", home, item);
+            snprintf(restored, sizeof restored, "%s/%s", argv[6], basename(item));
             mkdir(argv[6], 0700);
-            if (stat(path, &info) != 0 || copyfile(path, restored, NULL, COPYFILE_ALL) != 0) {
-                fprintf(stderr, "Error: no such path in %s: %s\n", argv[4], argv[5]);
+            char folder[4096];
+            snprintf(folder, sizeof folder, "%s", path);
+            *strrchr(folder, '/') = 0;
+            if (!holds(folder, basename(item)) || stat(path, &info) != 0 || copyfile(path, restored, NULL, COPYFILE_ALL) != 0) {
+                fprintf(stderr, "Error: no such path in %s: %s\n", argv[4], item);
                 return 255;
             }
             if (alter && !strcmp(alter, "alter")) {
@@ -74,7 +97,10 @@ private let stub = #"""
         }
         fclose(arguments);
         if (mode && !strcmp(mode, "hang")) { touch(home, "client-started"); sleep(300); return 0; }
-        if (mode && !strcmp(mode, "fail")) { fprintf(stderr, "Error: the datastore is full\n"); return 255; }
+        /* The last line the client writes, without a newline at its end. */
+        if (mode && !strcmp(mode, "fail")) { fprintf(stderr, "Error: the datastore is full"); return 255; }
+        /* A backup that lacks a.txt: the snapshot the run reads from still has it, a restore finds nothing. */
+        if (mode && !strcmp(mode, "lose")) { snprintf(path, sizeof path, "%s/Source/a.txt", home); unlink(path); }
         fprintf(stderr, "Starting backup: [test]:host/test-mac/2026-01-02T03:04:05Z\n");
         puts("{\"type\":\"progress\",\"entries\":2,\"bytes_processed\":10,\"bytes_uploaded\":4,\"path\":\"a.txt\",\"elapsed\":0.1}");
         puts("{\"type\":\"result\",\"ok\":true,\"snapshot\":\"host/test-mac/2026-01-02T03:04:05Z\",\"namespace\":\"test\",\"entries\":2,\"bytes_processed\":10,\"bytes_reused\":6,\"bytes_uploaded\":4,\"skipped_placeholders\":[],\"skipped_placeholder_count\":0,\"time_machine_excluded\":0,\"warnings\":[],\"duration\":0.1}");
@@ -252,11 +278,40 @@ struct PrivateHomeTests {
     #expect(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted() == ["a 2.txt", "a.txt"])   // no staging folder left
 }
 
+@Test func aRunningClientShowsItsSecretsToNoOtherProgram() throws {
+    let fixture = try Fixture()
+    setenv("PBS_MACKUP_STUB", "hang", 1)            // the stand-in stays, as a client does while it backs up
+    defer { unsetenv("PBS_MACKUP_STUB") }
+    let client = try Client(config: Config.load()).start(["backup"], mergingErrors: true)
+    defer { client.signal(SIGKILL); client.wait() }
+    try fixture.waitFor("client-started")
+    // What every program of the user can read of another: its arguments and its environment.
+    let shown = tool("/bin/ps", ["-E", "-ww", "-o", "command=", "-p", "\(client.pid)"]).output
+    try #require(shown.contains("PBS_PASSWORD_FD=3"), "ps did not show the environment: \(shown)")
+    #expect(!shown.contains(token) && !shown.contains(key))
+    // The token went over descriptor 3, as one line.
+    #expect(try String(contentsOf: fixture.home.appendingPathComponent("client-token"), encoding: .utf8) == token + "\n")
+    // And the client ends when it is interrupted, which is how a run is cancelled.
+    client.interrupt()
+    #expect(client.wait() == SIGINT)
+}
+
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["PBS_MACKUP_SNAPSHOT_TESTS"] == "1"))
 struct RunToolTests {
     @Test func aRunReadsFromItsSnapshotAndLeavesNothingBehind() throws {
         let before = localSnapshots()
         let fixture = try Fixture()
+        // A file and a rule with ü in one piece, as git, unzip or a browser write it. Made
+        // with open, which keeps the name as it is given; Foundation would take the accent apart.
+        let named = "Z\u{FC}rich.txt", rule = "B\u{FC}cher"
+        let file = open(fixture.home.path + "/Source/" + named, O_CREAT | O_WRONLY, 0o600)
+        #expect(file >= 0 && write(file, "hello", 5) == 5 && close(file) == 0)
+        var times = [timeval(tv_sec: 1_600_000_000, tv_usec: 0), timeval(tv_sec: 1_600_000_000, tv_usec: 0)]
+        #expect(utimes(fixture.home.path + "/Source/" + named, &times) == 0)
+        var config = try Config.load()
+        config.excludes += [rule, "-dash"]
+        try config.save()
+
         let result = try fixture.run("ok")
         #expect(result.status == 0, "\(result.output)")
         let record = try #require(fixture.state.last)
@@ -265,27 +320,33 @@ struct RunToolTests {
         #expect(record.snapshot == "host/test-mac/2026-01-02T03:04:05Z")
         #expect(record.result.entries == 2)
         #expect(record.result.bytesUploaded == 4)
-        #expect(record.checkedFiles == 2)                 // both files were restored and compared
+        // All three files were restored and compared. The stand-in, like the client, only finds
+        // a name that reaches it byte for byte.
+        #expect(record.checkedFiles == 3)
         #expect(record.mismatches == nil)
         #expect(fixture.exists("source-visible"))        // the client was pointed at an existing folder inside the mount
-        let arguments = try String(contentsOf: fixture.home.appendingPathComponent("client-arguments"), encoding: .utf8)
+        let noted = try Data(contentsOf: fixture.home.appendingPathComponent("client-arguments"))
+        let arguments = String(decoding: noted, as: UTF8.self)
         #expect(arguments.contains("Source.pxar:\(Paths.mount.path)/"))
         // The default exclusions and the owner's own, encryption, change detection, a stable group.
-        for expected in ["--exclude\n.DS_Store\n", "--exclude\n/Library/Caches\n", "--exclude\n*.tmp\n", "--crypt-mode\nencrypt\n",
+        // Each exclusion in one piece with its option, so that one with a dash in front is no option.
+        for expected in ["--exclude=.DS_Store\n", "--exclude=/Library/Caches\n", "--exclude=*.tmp\n", "--exclude=-dash\n", "--crypt-mode\nencrypt\n",
                          "--change-detection-mode=metadata\n", "--backup-id\ntest-mac\n", "--ns\ntest\n", "--skip-tm-excluded\ntrue\n"] {
             #expect(arguments.contains(expected), "missing \(expected)")
         }
+        #expect(noted.range(of: Data("--exclude=\(rule)\n".utf8)) != nil)     // the rule's own bytes
         #expect(!fixture.mounted)
         #expect(fixture.state.localSnapshot == nil)
         #expect(fixture.state.running == nil)
         #expect(localSnapshots() == before)               // its own snapshot is gone, Time Machine's are all there
 
-        // No secret in the client's arguments or in the log.
+        // No secret in the client's arguments or in the log; the token came over descriptor 3.
         let log = try String(contentsOfFile: try #require(record.log), encoding: .utf8)
         for secret in [token, key] {
             #expect(!arguments.contains(secret))
             #expect(!log.contains(secret))
         }
+        #expect(try String(contentsOf: fixture.home.appendingPathComponent("client-token"), encoding: .utf8) == token + "\n")
     }
 
     @Test func aLaterRunHandsTheClientOnlyWhatChanged() throws {
@@ -398,15 +459,44 @@ struct RunToolTests {
         #expect(result.status == Runner.Exit.failed.rawValue)
         let record = try #require(fixture.state.last)
         #expect(record.outcome == .failed)
-        #expect(record.step == "verify")
+        #expect(record.step == .verify)
         #expect(record.checkedFiles == 2)
         #expect(record.mismatches?.sorted() == ["a.txt (contents)", "tagged.txt (contents)"])
         #expect(record.reason?.contains("a.txt (contents)") == true)
         #expect(record.snapshot == "host/test-mac/2026-01-02T03:04:05Z")   // the snapshot exists; the record says which
+        #expect(fixture.state.changeBase == nil)          // but the next run takes nothing over from it
         #expect(fixture.state.consecutiveFailures == 1)
         #expect(fixture.state.lastSuccess == nil)
         #expect(!fixture.mounted)
         #expect(localSnapshots() == before)
+    }
+
+    @Test func aFileTheBackupLostFailsTheRunWhateverTheOwnerLeavesOut() throws {
+        let fixture = try Fixture()                       // the owner leaves out *.tmp, which a.txt is not
+        var result = try fixture.run("ok")
+        #expect(result.status == 0, "\(result.output)")
+        #expect(fixture.state.changeBase != nil)
+        result = try fixture.run("lose")
+        #expect(result.status == Runner.Exit.failed.rawValue)
+        let record = try #require(fixture.state.last)
+        #expect(record.outcome == .failed)
+        #expect(record.step == .verify)
+        #expect(record.checkedFiles == 2)
+        #expect(record.mismatches == ["a.txt (cannot be restored: no such path in Source.pxar: a.txt)"])
+        #expect(fixture.state.changeBase == nil)          // the earlier basis is gone too: the next run reads everything
+    }
+
+    @Test func aMissingFileIsForgivenUnderARuleTheCheckCannotJudge() throws {
+        let fixture = try Fixture()
+        var config = try Config.load()
+        config.excludes = ["**/drafts"]                   // may well leave out a.txt, as far as the check can tell
+        try config.save()
+        let result = try fixture.run("lose")
+        #expect(result.status == 0, "\(result.output)")
+        let record = try #require(fixture.state.last)
+        #expect(record.outcome == .success)
+        #expect(record.checkedFiles == 1)
+        #expect(record.mismatches == nil)
     }
 
     @Test func aFailingClientIsRecordedWithItsError() throws {
@@ -416,7 +506,7 @@ struct RunToolTests {
         #expect(result.status == Runner.Exit.failed.rawValue)
         let record = try #require(fixture.state.last)
         #expect(record.outcome == .failed)
-        #expect(record.step == "backup")
+        #expect(record.step == .backup)
         #expect(record.reason == "the datastore is full")
         #expect(fixture.state.consecutiveFailures == 1)
         #expect(fixture.state.lastSuccess == nil)

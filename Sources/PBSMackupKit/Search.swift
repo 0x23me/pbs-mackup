@@ -122,7 +122,10 @@ extension Client {
 
     /// Writes the names of everything in these archives of a snapshot into the cache, unless
     /// that was done before, and returns the file. Only names, sizes and dates are fetched.
+    /// A home folder has a few million of them, so they go from the client to the file line
+    /// by line and are never all in memory here.
     public func index(snapshot: String, archives: [String]) throws -> URL {
+        try Client.check(snapshot: snapshot, archives: archives)
         let manager = FileManager.default
         try manager.createDirectory(at: Paths.index, withIntermediateDirectories: true)
         // An index stays valid, but there is one per snapshot: those not used for two weeks go.
@@ -137,19 +140,45 @@ extension Client {
             try? manager.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
             return file
         }
-        struct Listed: Decodable { let path: String, type: String, mtime: Int64, size: Int64? }
-        var items: [SnapshotIndex.Item] = []
-        let decoder = JSONDecoder()
-        for archive in archives {
-            let lines = try capture(["catalog", "list", snapshot, archive, "--recursive", "true"])
-            for line in lines.split(separator: UInt8(ascii: "\n")) {
-                let entry = try decoder.decode(Listed.self, from: Data(line))
-                items.append(.init(archive: archive, path: entry.path, type: entry.type, mtime: entry.mtime, size: entry.size))
-            }
+        // File names are private: the file is the owner's alone from the moment it exists. It
+        // is written under another name and takes its own when it is complete.
+        let scratch = file.appendingPathExtension(UUID().uuidString)
+        let descriptor = open(scratch.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        guard descriptor >= 0 else { throw Failure(description: "The index could not be written: \(String(cString: strerror(errno))).") }
+        let out = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        defer { unlink(scratch.path) }
+        // The client prints one item to a line, {"path":…,"type":…,"mtime":…,"size":…}. With
+        // the archive's name put in front, such a line is an item of the index as it stands;
+        // an archive's name holds nothing that would need escaping.
+        var buffer = Data("[".utf8), lines = 0
+        func write(_ line: Data, of archive: String) throws {
+            guard line.count > 2, line.first == UInt8(ascii: "{") else { return }
+            buffer.append(Data(((lines == 0 ? "" : ",\n") + #"{"archive":"\#(archive)","#).utf8))
+            buffer.append(line.dropFirst())
+            lines += 1
+            if buffer.count > 1 << 20 { try out.write(contentsOf: buffer); buffer.removeAll(keepingCapacity: true) }
         }
-        try JSONEncoder().encode(items).write(to: file, options: .atomic)
-        // File names are private; the cache folder is the owner's, the file is too.
-        try? manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        for archive in archives {
+            var rest = Data(), failure: Error?
+            try stream(["catalog", "list", snapshot, archive, "--recursive", "true"]) { piece in
+                var start = piece.startIndex
+                while failure == nil, let end = piece[start...].firstIndex(of: 0x0A) {
+                    rest.append(piece[start..<end])
+                    do { try write(rest, of: archive) } catch { failure = error }
+                    rest.removeAll(keepingCapacity: true)
+                    start = piece.index(after: end)
+                }
+                rest.append(piece[start...])
+            }
+            if let failure { throw failure }
+            try write(rest, of: archive)      // a last line without its newline
+        }
+        buffer.append(Data("]".utf8))
+        try out.write(contentsOf: buffer)
+        try out.close()
+        guard rename(scratch.path, file.path) == 0 else {
+            throw Failure(description: "The index could not be written: \(String(cString: strerror(errno))).")
+        }
         return file
     }
 }

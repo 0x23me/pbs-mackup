@@ -13,8 +13,8 @@ The client is linked with **OpenSSL 3** (Apache-2.0) and **zstd** (BSD-3-Clause)
 built by Homebrew, and with the Rust crates named in its `Cargo.lock`, each under its own
 license.
 
-**FUSE-T** (fuse-t.org) is not part of the app. When it is installed, the client loads its
-library to show a snapshot in Finder.
+**FUSE-T** (fuse-t.org) is not part of the app. When it is installed, the copy of the client
+that shows a snapshot in Finder loads its library.
 
 "Proxmox" is a registered trademark of Proxmox Server Solutions GmbH. This project is not
 affiliated with, endorsed or supported by Proxmox.

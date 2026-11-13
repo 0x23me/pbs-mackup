@@ -20,6 +20,9 @@ repository="${PBS_MACKUP_REPOSITORY:-0x23me/pbs-mackup}"
 PBS_MACKUP_VERSION="$version" ./Scripts/bundle.sh
 app=.build/PBSMackup.app
 id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
+# The app mounts its snapshots in the group container of the team that signed it.
+team="$(codesign -dv "$app" 2>&1 | sed -n 's/^TeamIdentifier=\([A-Z0-9]*\)$/\1/p')"
+[ -n "$team" ] || { echo "the app is not signed by a developer; a release has to be" >&2; exit 1; }
 mkdir -p dist
 zip="dist/PBSMackup-$version.zip"
 rm -f "$zip"
@@ -47,12 +50,13 @@ cask "pbs-mackup" do
 
   app "PBSMackup.app"
 
-  uninstall launchctl: "$id.run",
+  uninstall launchctl: ["$id.scheduled", "$id.manual", "$id.helper", "$id.run"],
             quit:      "$id"
 
   zap trash: [
     "~/Library/Application Support/pbs-mackup",
     "~/Library/Caches/pbs-mackup",
+    "~/Library/Group Containers/$team.$id",
   ]
 
   caveats <<~EOS

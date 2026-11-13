@@ -1,11 +1,21 @@
+import Darwin
 import Foundation
 
 // The state file (`state.json`) is how the run tool tells the app what happened and what is
-// happening. The run tool rewrites it atomically; the app only reads it, except for `paused`.
+// happening. The run tool rewrites it atomically and is the only one to write it; the app
+// only reads it.
 
 public enum Trigger: String, Codable { case scheduled, manual }
 
 public enum Outcome: String, Codable { case success, skipped, cancelled, failed }
+
+/// The step a run failed at.
+public enum Step: String, Codable { case setup, snapshot, backup, verify }
+
+/// What a run is doing.
+public enum Phase: String, Codable {
+    case preparing, backingUp = "backing up", checking, cleaningUp = "cleaning up"
+}
 
 public struct RunRecord: Codable, Equatable {
     public var start: Date
@@ -14,8 +24,7 @@ public struct RunRecord: Codable, Equatable {
     public var outcome: Outcome
     /// Why it was skipped or failed, in words for the menu.
     public var reason: String?
-    /// The step that failed: snapshot, mount, backup, ...
-    public var step: String?
+    public var step: Step?
     /// The PBS snapshot, e.g. `host/my-mac/2026-11-12T08:00:00Z`.
     public var snapshot: String?
     /// False when the live folders were read because the APFS snapshot could not be mounted.
@@ -67,8 +76,7 @@ public struct BackupResult: Codable, Equatable {
 }
 
 public struct Progress: Codable, Equatable {
-    /// preparing, backing up, checking, cleaning up
-    public var step: String
+    public var step: Phase
     /// Amounts and time as text for the menu.
     public var processed: String?
     public var uploaded: String?
@@ -94,6 +102,24 @@ public struct Running: Codable, Equatable {
     public var start: Date
     public var trigger: Trigger
     public var progress: Progress
+
+    /// Whether the run tool that wrote this is still at it. After a crash or a restart the
+    /// record stays in the file for up to five minutes, and its process id may be another
+    /// program's by then.
+    public var isLive: Bool { Running.isProcess(pid, program: "pbs-mackup-run", startedBy: start) }
+
+    /// True when `pid` is a process that runs `program` and began no later than `date`. One
+    /// that began after it has taken the id over from the process that was meant.
+    static func isProcess(_ pid: Int32, program: String, startedBy date: Date) -> Bool {
+        var buffer = [CChar](repeating: 0, count: 4096)   // PROC_PIDPATHINFO_MAXSIZE
+        guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0,
+              String(cString: buffer).hasSuffix("/" + program) else { return false }
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return false }
+        // In whole seconds, which is how the state file keeps the start of a run.
+        return Double(info.pbi_start_tvsec) <= date.timeIntervalSince1970
+    }
 }
 
 /// What the next run needs to read only what changed: where the change log was before the
@@ -117,30 +143,25 @@ public struct State: Codable, Equatable {
     public var consecutiveFailures = 0
     public var changeBase: ChangeBase?
     public var history: [RunRecord] = []
-    /// Set by the app: scheduled runs do nothing while true.
-    public var paused = false
+    /// Not in use any more: the pause is a file of its own, see `Pause`. A `true` from before
+    /// that is moved there by the next run. The field is still written, as `false`, for an
+    /// app from before that is still running and cannot read the file without it.
+    var paused = false
 
     public init() {}
 
-    private static var encoder: JSONEncoder {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        return encoder
-    }
-
     public static func load(from url: URL = Paths.state) -> State {
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        guard let data = try? Data(contentsOf: url), let state = try? decoder.decode(State.self, from: data) else {
+        guard let data = try? Data(contentsOf: url), let state = try? JSONDecoder.iso8601.decode(State.self, from: data) else {
             return State()
         }
         return state
     }
 
     public func save(to url: URL = Paths.state) throws {
+        let encoder = JSONEncoder.iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try State.encoder.encode(self).write(to: url, options: .atomic)
+        try encoder.encode(self).write(to: url, options: .atomic)
     }
 
     public mutating func finish(_ record: RunRecord) {
@@ -152,5 +173,28 @@ public struct State: Codable, Equatable {
         case .skipped, .cancelled: break
         }
         history = Array((history + [record]).suffix(100))
+    }
+
+    /// When the next scheduled run is due; the run tool and the app's "Next backup" both go by
+    /// this. It is one interval after the last successful run began. A skipped run changes
+    /// nothing, so it is tried again when launchd next starts the tool, five minutes later. A
+    /// failed run is tried again a quarter of an hour after it ended, then after twice as long
+    /// each time it fails again, never after more than the interval. A cancelled run is
+    /// followed by a whole interval, so that it does not start over right after the owner
+    /// stopped it.
+    public func nextRun(intervalMinutes: Int) -> Date {
+        let interval = Double(intervalMinutes * 60)
+        var next = lastSuccess?.start.addingTimeInterval(interval) ?? .distantPast
+        guard let last else { return next }
+        switch last.outcome {
+        case .failed:
+            let wait = min(interval, 900 * pow(2, Double(min(max(consecutiveFailures, 1), 16) - 1)))
+            next = max(next, last.end.addingTimeInterval(wait))
+        case .cancelled:
+            next = max(next, last.start.addingTimeInterval(interval))
+        case .success, .skipped:
+            break
+        }
+        return next
     }
 }

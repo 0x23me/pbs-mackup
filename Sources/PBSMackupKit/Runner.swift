@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import IOKit.ps
 
 /// One backup run: skip checks, frozen snapshot, client, cleanup, record.
 public final class Runner {
@@ -16,7 +17,7 @@ public final class Runner {
     private var logURL: URL?
     private let lock = NSLock()
     private var cancelled = false
-    private var child: Process?
+    private var child: Child?
 
     public init(config: Config, trigger: Trigger, readEverything: Bool = false) {
         self.config = config
@@ -29,9 +30,9 @@ public final class Runner {
     public func cancel() {
         lock.lock()
         cancelled = true
-        let process = child
+        let client = child
         lock.unlock()
-        process?.interrupt()
+        client?.interrupt()
     }
 
     private var isCancelled: Bool {
@@ -51,30 +52,48 @@ public final class Runner {
         defer { close(lockFD) }
 
         state = State.load()
+        // A pause from before it had a file of its own moves there.
+        if state.paused, (try? Pause.set(true)) != nil {
+            state.paused = false
+            save()
+        }
         stopOrphanedClient()
         removeLeftovers()
-        if state.paused && trigger == .scheduled {
+        if (Pause.isOn || state.paused) && trigger == .scheduled {
             print("automatic backups are paused")
             return .done
         }
-        // launchd starts the tool every few minutes; it runs when the owner's interval is over.
-        if trigger == .scheduled, !Runner.isDue(last: state.last?.start, intervalMinutes: config.interval, now: start) {
+        // launchd starts the tool every few minutes; it runs when a backup is due.
+        if trigger == .scheduled, !Runner.isDue(state, intervalMinutes: config.interval, now: start) {
             print("the next backup is not due yet")
             return .done
         }
 
+        // A configuration that did not come from the app could name another server or other
+        // folders, so it is not even asked whether its server is there. The run's record says
+        // so, and with it the menu.
+        guard Seal.holds(config) else {
+            _ = finish(.failed, reason: Seal.configChanged, step: .setup, frozen: false, output: ClientOutput())
+            return .notConfigured
+        }
         if let reason = skipReason() {
+            // A skipped run is tried again five minutes later. As long as the reason stays the
+            // same, the first record stands for all of them and the state file is left alone.
+            if trigger == .scheduled, state.last?.outcome == .skipped, state.last?.reason == reason {
+                print("skipped: \(reason)")
+                return .done
+            }
             return finish(.skipped, reason: reason, step: nil, frozen: false, output: ClientOutput())
         }
         let client: Client
         do { client = try Client(config: config) } catch {
-            _ = finish(.failed, reason: "\(error)", step: "setup", frozen: false, output: ClientOutput())
+            _ = finish(.failed, reason: "\(error)", step: .setup, frozen: false, output: ClientOutput())
             return .notConfigured
         }
 
         openLog()
         state.running = Running(pid: getpid(), start: start, trigger: trigger,
-                                progress: Progress(step: "preparing", updated: Date()))
+                                progress: Progress(step: .preparing, updated: Date()))
         save()
         let activity = ProcessInfo.processInfo.beginActivity(
             options: [.idleSystemSleepDisabled, .background], reason: "Backup to Proxmox Backup Server")
@@ -104,12 +123,12 @@ public final class Runner {
                 log("snapshot could not be mounted (\(error)); reading the live folders instead")
             }
         } catch {
-            return finish(.failed, reason: "\(error)", step: "snapshot", frozen: false, output: ClientOutput())
+            return finish(.failed, reason: "\(error)", step: .snapshot, frozen: false, output: ClientOutput())
         }
         defer { removeLeftovers() }
 
         let settings = settingsDigest(client: client)
-        let plan = changedFolders(root: root, settings: settings, client: client)
+        let plan = changedFolders(root: root, settings: settings)
         log(plan.note)
         defer { try? FileManager.default.removeItem(at: Paths.changedFolders) }
 
@@ -119,26 +138,38 @@ public final class Runner {
         if isCancelled {
             return finish(.cancelled, reason: nil, step: nil, frozen: frozen, output: output)
         }
-        // The position belongs to the snapshot this run read from, so it is only a basis
-        // together with the backup made from it. A run that fails keeps the earlier basis;
-        // the client checks that the backup it builds on is that one.
-        if status == 0, let position, let snapshot = output.snapshot {
-            state.changeBase = ChangeBase(position: position, snapshot: snapshot, settings: settings)
-        }
+        // A run whose client fails keeps the earlier basis; the client checks that the backup
+        // it builds on is that one.
         guard status == 0 else {
-            return finish(.failed, reason: output.result.error ?? "The client exited with status \(status).",
-                          step: "backup", frozen: frozen, output: output)
+            var reason = output.result.error ?? "The client exited with status \(status)."
+            // The client stops at a file that changes while it reads it, which only happens
+            // where there is no frozen snapshot to read from.
+            if !frozen, reason.contains("while being archived") || reason.contains("changed during capture") {
+                reason += " The folders were read as they are, where a file can change while it is read. "
+                    + "With Full Disk Access a backup reads from a frozen snapshot instead."
+            }
+            return finish(.failed, reason: reason, step: .backup, frozen: frozen, output: output)
         }
 
-        state.running?.progress = Progress(step: "checking", updated: Date())
+        state.running?.progress = Progress(step: .checking, updated: Date())
         save()
         let check = checkSample(client: client, snapshot: output.snapshot, root: root)
-        state.running?.progress = Progress(step: "cleaning up", updated: Date())
+        state.running?.progress = Progress(step: .cleaningUp, updated: Date())
         save()
         guard check.mismatches.isEmpty else {
+            // A backup that does not read back as it went in is nothing to take folders over
+            // from: the next run reads everything.
+            state.changeBase = nil
             let named = check.mismatches.prefix(5).joined(separator: "; ") + (check.mismatches.count > 5 ? "; …" : "")
             return finish(.failed, reason: "\(check.mismatches.count) of \(check.checked) files restored as a check differ from what was backed up: \(named)",
-                          step: "verify", frozen: frozen, output: output, check: check)
+                          step: .verify, frozen: frozen, output: output, check: check)
+        }
+        // The position belongs to the snapshot this run read from, so it is only a basis
+        // together with the backup made from it, and only now that this backup has passed its
+        // check. Without a position the earlier basis goes as well: it is not the newest
+        // backup any more.
+        state.changeBase = position.flatMap { position in
+            output.snapshot.map { ChangeBase(position: position, snapshot: $0, settings: settings) }
         }
         return finish(.success, reason: nil, step: nil, frozen: frozen, output: output, check: check)
     }
@@ -147,21 +178,21 @@ public final class Runner {
     private func checkSample(client: Client, snapshot: String?, root: String) -> (checked: Int, mismatches: [String]) {
         let count = config.sampleFiles ?? 20
         guard let snapshot, count > 0, !config.sources.isEmpty else { return (0, []) }
-        let staging = Paths.cache.appendingPathComponent("check-\(UUID().uuidString)")
+        // The restored files are readable copies of what the backup keeps encrypted, and they
+        // can be anything in the home folder: they go where other programs are kept out.
+        let staging = Paths.guarded.appendingPathComponent("check-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        defer {
-            // Each restored item sits in a folder that got the metadata of the archive's root,
-            // possibly with an ACL that forbids deleting it.
-            tool("/bin/chmod", ["-R", "-N", staging.path])
-            try? FileManager.default.removeItem(at: staging)
-        }
+        defer { removeRestored(staging) }
         var checked = 0
         var mismatches: [String] = []
         let share = max(1, count / config.sources.count)
+        // The picker leaves out what the owner's rules leave out, as far as it can judge them.
+        let judged = config.excludes.allSatisfy(SampleCheck.canJudge)
         for source in config.sources {
             let path = realPath(source)
             let folder = URL(fileURLWithPath: root + path)
-            for relative in SampleCheck.pick(in: folder, count: share, maxBytes: 200_000_000 / Int64(config.sources.count)) {
+            for relative in SampleCheck.pick(in: folder, count: share, maxBytes: 200_000_000 / Int64(config.sources.count),
+                                             excludes: config.excludes) {
                 if isCancelled { return (checked, mismatches) }
                 let original = folder.appendingPathComponent(relative)
                 // Reading the live folders: a file changed since the run began proves nothing.
@@ -169,10 +200,12 @@ public final class Runner {
                    modified >= start { continue }
                 let target = staging.appendingPathComponent("\(checked)")
                 do {
-                    _ = try client.capture(["catalog", "extract", snapshot, Config.archiveName(for: path), relative, target.path])
+                    _ = try client.capture(["catalog", "extract", snapshot, Config.archiveName(for: path), Client.pathArgument(relative), target.path])
                 } catch {
-                    // With exclusion patterns a picked file may rightly be absent from the snapshot.
-                    if "\(error)".contains("no such path"), !config.excludes.isEmpty { continue }
+                    // A picked file is only rightly absent from the snapshot where the picker
+                    // could not tell; anywhere else the backup has lost it.
+                    if Client.isMissingPath(error),
+                       !judged || SampleCheck.mayBeAbsent(relative, in: folder, liveSince: root.isEmpty ? start : nil) { continue }
                     checked += 1
                     mismatches.append("\(relative) (cannot be restored: \(error))")
                     continue
@@ -186,20 +219,16 @@ public final class Runner {
         return (checked, mismatches)
     }
 
-    /// The real path of a source: inside the snapshot there is no /var or /tmp link, only /private/var.
-    private func realPath(_ source: String) -> String {
-        let expanded = (source as NSString).expandingTildeInPath
-        return realpath(expanded, nil).map { pointer -> String in defer { free(pointer) }; return String(cString: pointer) } ?? expanded
-    }
+    private func realPath(_ source: String) -> String { Config.realPath(source) }
 
     // MARK: - Changes
 
+    /// How this run found what to read, for its record.
     private var changes: String?
 
-    static func isDue(last: Date?, intervalMinutes: Int, now: Date) -> Bool {
+    static func isDue(_ state: State, intervalMinutes: Int, now: Date) -> Bool {
         // Half a minute of slack: launchd's timer is not exact.
-        guard let last else { return true }
-        return now.timeIntervalSince(last) >= Double(intervalMinutes * 60) - 30
+        now.timeIntervalSince(state.nextRun(intervalMinutes: intervalMinutes)) >= -30
     }
 
     /// What decides the content of a backup besides the files: when any of it changes,
@@ -208,20 +237,16 @@ public final class Runner {
         let attributes = try? FileManager.default.attributesOfItem(atPath: client.executable.path)
         let parts = config.sources.map(realPath) + ["--"] + Config.defaultExcludes + config.excludes
             + ["--", client.executable.path, "\(attributes?[.size] ?? 0)", "\(attributes?[.modificationDate] ?? 0)"]
-        return SHA256.hash(data: Data(parts.joined(separator: "\u{0}").utf8)).map { String(format: "%02x", $0) }.joined()
+        return SHA256.hash(data: Data(parts.joined(separator: "\u{0}").utf8)).hex()
     }
 
     /// Asks the change log which folders changed since the last successful run and writes
     /// them where the client reads them. `base` is the backup time the list is relative to;
     /// nil means: read everything, and `note` says why.
-    private func changedFolders(root: String, settings: String, client: Client) -> (base: String?, note: String) {
+    private func changedFolders(root: String, settings: String) -> (base: String?, note: String) {
         if readEverything { return (nil, "everything read: asked to") }
         guard let base = state.changeBase else { return (nil, "everything read: no earlier backup to build on") }
         guard base.settings == settings else { return (nil, "everything read: folders, exclusions or the client changed") }
-        // An older client knows nothing of such a list; its help says what it takes.
-        guard tool(client.executable.path, ["backup", "--help"]).output.contains("--changed-dirs") else {
-            return (nil, "everything read: this client cannot take a list of changes")
-        }
         guard let time = base.snapshot.split(separator: "/").last else { return (nil, "everything read: no earlier backup to build on") }
         let roots = config.sources.map(realPath)
         switch ChangeLog.changes(below: roots, since: base.position, marker: Paths.changeMarker) {
@@ -251,10 +276,11 @@ public final class Runner {
     }
 
     /// A scheduled run waits when the Mac runs on battery below 20 % or in Low Power Mode; a run
-    /// started by hand never does.
+    /// started by hand never does. The reason does not name the charge: it has to stay the same
+    /// from one try to the next, see `run`.
     static func batterySkip(trigger: Trigger, battery: (percent: Int, onAC: Bool)?, lowPowerMode: Bool) -> String? {
         guard trigger == .scheduled, let battery, !battery.onAC, battery.percent < 20 || lowPowerMode else { return nil }
-        return "On battery (\(battery.percent) %)."
+        return battery.percent < 20 ? "On battery below 20 %." : "On battery in Low Power Mode."
     }
 
     private func backup(root: String, client: Client, changed base: String?, output: inout ClientOutput) -> Int32 {
@@ -265,29 +291,29 @@ public final class Runner {
         }
         arguments += ["--backup-id", config.backupID, "--change-detection-mode=metadata", "--crypt-mode", "encrypt",
                       "--progress-json", "true", "--skip-placeholders", "true", "--skip-tm-excluded", "true"]
-        for pattern in Config.defaultExcludes + config.excludes { arguments += ["--exclude", pattern] }
+        // In one piece with its option: on its own, a pattern that begins with a dash is read as an option.
+        for pattern in Config.defaultExcludes + config.excludes { arguments.append("--exclude=\(pattern)") }
         if let base { arguments += ["--changed-dirs", Paths.changedFolders.path, "--changed-dirs-base", base] }
         log("client: \(client.executable.path) \(arguments.joined(separator: " "))")
 
-        let process = client.process(arguments)
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        do { try client.start(process) } catch {
+        let child: Child
+        do { child = try client.start(arguments, mergingErrors: true) } catch {
             output.read("Error: cannot start the client: \(error.localizedDescription)")
             return -1
         }
-        lock.lock(); child = process; lock.unlock()
-        if isCancelled { process.interrupt() }
-        state.running?.clientPID = process.processIdentifier
-        state.running?.progress = Progress(step: "backing up", updated: Date())
+        lock.lock(); self.child = child; lock.unlock()
+        if isCancelled { child.interrupt() }
+        state.running?.clientPID = child.pid
+        state.running?.progress = Progress(step: .backingUp, updated: Date())
         save()
         var pending = Data()
         var upload = UploadSpeed()
-        while true {
-            let chunk = pipe.fileHandleForReading.availableData
-            if chunk.isEmpty { break }
-            pending.append(chunk)
+        var ended = false
+        while !ended {
+            let chunk = child.output.availableData
+            // The end of the output also ends its last line, which may lack the newline.
+            ended = chunk.isEmpty
+            pending.append(ended && !pending.isEmpty ? Data([0x0A]) : chunk)
             while let newline = pending.firstIndex(of: 0x0A) {
                 let line = String(decoding: pending[pending.startIndex..<newline], as: UTF8.self)
                 pending.removeSubrange(pending.startIndex...newline)
@@ -300,7 +326,7 @@ public final class Runner {
                     // What went over the network; an older client only says how much data that was.
                     let speed = upload.add(bytes: progress.bytesSent ?? progress.bytesUploaded, at: progress.elapsed)
                     state.running?.progress = Progress(
-                        step: "backing up", processed: bytes(progress.bytesProcessed), uploaded: bytes(progress.bytesUploaded),
+                        step: .backingUp, processed: bytes(progress.bytesProcessed), uploaded: bytes(progress.bytesUploaded),
                         elapsed: seconds < 90 ? "\(seconds) s" : "\(seconds / 60) min", entries: progress.entries,
                         bytesProcessed: progress.bytesProcessed, bytesUploaded: progress.bytesUploaded,
                         speed: speed.flatMap(UploadSpeed.text), bitsPerSecond: speed,
@@ -309,24 +335,22 @@ public final class Runner {
                 }
             }
         }
-        process.waitUntilExit()
-        lock.lock(); child = nil; lock.unlock()
-        return process.terminationStatus
+        let status = child.wait()
+        lock.lock(); self.child = nil; lock.unlock()
+        return status
     }
 
     /// Stops the client of an earlier run whose run tool died: it would keep the backup group
     /// locked on the server and the snapshot mounted.
     private func stopOrphanedClient() {
         guard let stale = state.running else { return }
-        if let pid = stale.clientPID, pid != getpid() {
-            var buffer = [CChar](repeating: 0, count: 4096)   // PROC_PIDPATHINFO_MAXSIZE
-            let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
-            // Only if that process id still is a client: ids are reused.
-            if length > 0, String(cString: buffer).hasSuffix("/proxmox-backup-client") {
-                kill(pid, SIGTERM)
-                for _ in 0..<50 where kill(pid, 0) == 0 { usleep(100_000) }
-                if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
-            }
+        // Only if that process id still is that client: ids are reused. The client began before
+        // its run last wrote its progress.
+        if let pid = stale.clientPID, pid != getpid(),
+           Running.isProcess(pid, program: "proxmox-backup-client", startedBy: stale.progress.updated.addingTimeInterval(1)) {
+            kill(pid, SIGTERM)
+            for _ in 0..<50 where kill(pid, 0) == 0 { usleep(100_000) }
+            if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
         }
         state.running = nil
         save()
@@ -335,6 +359,8 @@ public final class Runner {
     /// Unmounts and deletes the snapshot this or an interrupted earlier run created.
     private func removeLeftovers() {
         LocalSnapshot.unmount(Paths.mount)
+        // An earlier version mounted in the cache; a run of it that was stopped left its snapshot there.
+        LocalSnapshot.unmount(Paths.cache.appendingPathComponent("mnt"))
         if let date = state.localSnapshot {
             LocalSnapshot.delete(date)
             state.localSnapshot = nil
@@ -342,18 +368,15 @@ public final class Runner {
         }
     }
 
-    private func finish(_ outcome: Outcome, reason: String?, step: String?, frozen: Bool, output: ClientOutput,
+    private func finish(_ outcome: Outcome, reason: String?, step: Step?, frozen: Bool, output: ClientOutput,
                         check: (checked: Int, mismatches: [String])? = nil) -> Exit {
         // A run that fails its check still wrote a snapshot; the record says which.
         let record = RunRecord(start: start, end: Date(), trigger: trigger, outcome: outcome, reason: reason, step: step,
-                               snapshot: outcome == .success || step == "verify" ? output.snapshot : nil, frozen: frozen,
+                               snapshot: outcome == .success || step == .verify ? output.snapshot : nil, frozen: frozen,
                                result: output.result, checkedFiles: check?.checked,
                                mismatches: check.flatMap { $0.mismatches.isEmpty ? nil : $0.mismatches },
                                changes: changes, log: logURL?.path)
         log("run \(outcome.rawValue)\(reason.map { ": " + $0 } ?? "")")
-        // Keep `paused` as the app last set it.
-        let paused = State.load().paused
-        state.paused = paused
         state.finish(record)
         save()
         print("\(outcome.rawValue)\(reason.map { ": " + $0 } ?? "")\(record.snapshot.map { " " + $0 } ?? "")")
@@ -426,15 +449,17 @@ enum Reachability {
 }
 
 enum Power {
-    /// Charge and power source from `pmset -g batt`; nil on a Mac without a battery.
+    /// Charge and power source of the built-in battery; nil on a Mac without one.
     static func battery() -> (percent: Int, onAC: Bool)? {
-        parse(tool("/usr/bin/pmset", ["-g", "batt"]).output)
-    }
-
-    static func parse(_ text: String) -> (percent: Int, onAC: Bool)? {
-        guard let percentSign = text.firstIndex(of: "%") else { return nil }
-        let digits = text[..<percentSign].reversed().prefix(while: \.isNumber).reversed()
-        guard let percent = Int(String(digits)) else { return nil }
-        return (percent, text.contains("'AC Power'"))
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let sources = IOPSCopyPowerSourcesList(info)?.takeRetainedValue() as? [CFTypeRef] else { return nil }
+        for source in sources {
+            guard let description = IOPSGetPowerSourceDescription(info, source)?.takeUnretainedValue() as? [String: Any],
+                  description[kIOPSTypeKey] as? String == kIOPSInternalBatteryType,
+                  let charge = description[kIOPSCurrentCapacityKey] as? Int,
+                  let full = description[kIOPSMaxCapacityKey] as? Int, full > 0 else { continue }
+            return (charge * 100 / full, description[kIOPSPowerSourceStateKey] as? String == kIOPSACPowerValue)
+        }
+        return nil
     }
 }

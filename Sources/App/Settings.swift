@@ -13,7 +13,7 @@ final class SettingsModel: ObservableObject {
 
     @Published var repository = ""
     @Published var namespace = ""
-    @Published var backupID = Host.current().localizedName?.replacingOccurrences(of: " ", with: "-").lowercased() ?? "mac"
+    @Published var backupID = SettingsModel.defaultBackupID
     /// Empty means: keep the token that is stored.
     @Published var token = ""
     @Published var sources: [String] = []
@@ -42,7 +42,7 @@ final class SettingsModel: ObservableObject {
         return Connection(repository: config.repository, namespace: config.namespace, backupID: config.backupID,
                           fingerprint: config.fingerprint)
     }
-    /// A certificate that is not publicly trusted, waiting for the owner's yes.
+    /// A certificate the client does not accept by itself, waiting for the owner's yes.
     @Published var unconfirmed: ServerCertificate.Info?
     private var confirmedFingerprint: String?
     /// A key made in this window needs a recovery copy before setup can finish.
@@ -51,6 +51,24 @@ final class SettingsModel: ObservableObject {
     @Published var recoveryConfirmed = false
 
     private var stored: Config?
+    /// The stored settings are not the ones this app saved: another program wrote config.json.
+    @Published private(set) var changedOutside = false
+
+    /// Whether the server takes `name` for a Mac's backups: the letters a to z, digits, `.`, `_`
+    /// and `-`, the first neither `.` nor `-`.
+    static func isBackupID(_ name: String) -> Bool { Client.isSnapshot("host/\(name)/2026-01-01T00:00:00Z") }
+
+    /// What a first setup calls this Mac's backups: the Mac's name in lower case with dashes for
+    /// spaces. Where the server would not take that, it is the words of the name with dashes
+    /// between them, so “Felix’s MacBook Pro” is `felixs-macbook-pro`.
+    static var defaultBackupID: String {
+        let name = (Host.current().localizedName ?? "").lowercased()
+        let plain = name.replacingOccurrences(of: " ", with: "-")
+        if isBackupID(plain) { return plain }
+        let words = name.folding(options: .diacriticInsensitive, locale: nil).filter { !"'’".contains($0) }
+            .split { !($0.isASCII && ($0.isLetter || $0.isNumber)) }
+        return words.isEmpty ? "mac" : words.joined(separator: "-")
+    }
 
     var config: Config {
         var config = stored ?? Config(repository: "", namespace: "", backupID: "", sources: [])
@@ -65,7 +83,7 @@ final class SettingsModel: ObservableObject {
     }
 
     var canFinish: Bool {
-        accepted == connection && token.isEmpty && status?.key.present == true && !sources.isEmpty
+        accepted == connection && token.isEmpty && status?.key.present == true && status?.key.foreign != true && !sources.isEmpty
             && (!keyIsNew || (recoveryExported && recoveryConfirmed))
     }
 
@@ -78,13 +96,21 @@ final class SettingsModel: ObservableObject {
             sources = config.sources
             rules = config.excludes
             intervalMinutes = config.interval
-            confirmedFingerprint = config.fingerprint
+            // Settings that another program wrote are shown, to be looked at, and count for
+            // nothing: not the certificate they vouch for, and not as accepted by the server.
+            changedOutside = !Seal.holds(config)
+            confirmedFingerprint = changedOutside ? nil : config.fingerprint
         } else {
             // A first setup starts with the whole home folder; the list below is for thinning it out.
             sources = [NSHomeDirectory()]
         }
-        if let override = ProcessInfo.processInfo.environment["PBS_MACKUP_RENDER_SOURCES"] { sources = override.components(separatedBy: ":") }
         expanded = Set(sources)
+        #if DEBUG
+        // For pictures of the window during development, see `Render`: other folders, opened rows, a tab.
+        if let override = ProcessInfo.processInfo.environment["PBS_MACKUP_RENDER_SOURCES"] {
+            sources = override.components(separatedBy: ":")
+            expanded = Set(sources)
+        }
         for path in ProcessInfo.processInfo.environment["PBS_MACKUP_RENDER_EXPAND"]?.components(separatedBy: ":") ?? [] {
             expanded.insert(sources[0] + "\u{0}" + path)
         }
@@ -93,9 +119,14 @@ final class SettingsModel: ObservableObject {
         case "key": tab = .key
         default: break
         }
+        #endif
         await refreshStatus()
-        // What was stored went through the server check when it was saved.
-        if stored != nil, status?.token == true { accepted = connection }
+        // What is stored went through the server check before it was saved; see `testConnection`.
+        if stored != nil, status?.token == true, !changedOutside { accepted = connection }
+        if changedOutside {
+            tab = .server
+            message = "These settings were changed outside the app. Look through all three tabs, test the connection, then click Done."
+        }
         for source in sources {
             if let known = FolderSizes.load(for: source) { measured[source] = known }
             // Sizes drift; a day-old measurement is still good enough to open with.
@@ -104,7 +135,9 @@ final class SettingsModel: ObservableObject {
     }
 
     func refreshStatus() async {
+        #if DEBUG
         if Render.active { return }
+        #endif
         status = try? await RunTool.decode(SetupStatus.self, ["setup-status"])
         fullDiskAccess = FullDiskAccess.granted
     }
@@ -177,29 +210,34 @@ final class SettingsModel: ObservableObject {
         do { try await body() } catch { message = "\(error)" }
     }
 
-    /// Checks the certificate, then lets the server judge repository, namespace and token.
+    /// Checks the certificate, then lets the server judge repository, namespace and token. The
+    /// run tool stores the token and the configuration once the server accepted them, and
+    /// nothing when it did not.
     func testConnection() async {
         accepted = nil
         message = ""
         let candidate = config
         guard let server = candidate.server else { message = "The repository should look like user@realm!token@host:datastore."; return }
+        guard SettingsModel.isBackupID(candidate.backupID) else {
+            message = "The name of this Mac's backups can only have the letters a to z, digits, “.”, “_” and “-”, and cannot begin with “.” or “-”."
+            return
+        }
         await work {
             guard let certificate = await ServerCertificate.fetch(host: server.host, port: server.port) else {
-                throw Client.Failure(description: "The server \(server.host) is not reachable.")
+                throw Failure(description: "The server \(server.host) is not reachable.")
             }
             if !certificate.trusted && certificate.fingerprint != confirmedFingerprint {
                 unconfirmed = certificate      // the alert calls back with the answer
                 return
             }
             if certificate.trusted { confirmedFingerprint = nil }
-            let asked = connection
-            try config.save()
-            if !token.isEmpty {
-                _ = try await RunTool.call(["set-token"], input: Data(token.utf8))
-                token = ""
-            }
-            _ = try await RunTool.call(["check"])
-            stored = config
+            // As `pbs-mackup-run accept` takes it; `token` only when one was typed in.
+            struct Candidate: Encodable { let config: Config, token: String? }
+            let asked = connection, checked = config
+            _ = try await RunTool.call(["accept"], input: JSONEncoder().encode(Candidate(config: checked, token: token.isEmpty ? nil : token)))
+            token = ""
+            stored = checked
+            changedOutside = false
             accepted = asked
             message = "The server accepted the connection."
             await refreshStatus()
@@ -219,21 +257,32 @@ final class SettingsModel: ObservableObject {
         panel.allowsMultipleSelection = true
         panel.prompt = "Back Up"
         guard panel.runModal() == .OK else { return }
-        for url in panel.urls { add(source: url.path) }
+        add(sources: panel.urls.map(\.path))
     }
 
-    func add(source: String) {
-        guard !sources.contains(source) else { return }
-        sources.append(source)
-        expanded.insert(source)
-        if let known = FolderSizes.load(for: source) { measured[source] = known }
-        measure(source)
+    func add(source: String) { add(sources: [source]) }
+
+    /// Adds folders to back up, and says of each one a run could not back up why it was not added.
+    private func add(sources added: [String]) {
+        var objections: [String] = []
+        for source in added {
+            // One at a time: two folders picked together can be in each other's way.
+            if let objection = Config.objection(toAdding: source, to: sources) { objections.append(objection); continue }
+            sources.append(source)
+            expanded.insert(source)
+            if let known = FolderSizes.load(for: source) { measured[source] = known }
+            measure(source)
+        }
+        message = objections.joined(separator: " ")
     }
 
     /// Measures a folder and what is in it. The run tool does it: with Full Disk Access it
     /// can read every folder, which the app itself cannot.
     func measure(_ source: String) {
-        guard !measuring.contains(source), !Render.active else { return }
+        guard !measuring.contains(source) else { return }
+        #if DEBUG
+        if Render.active { return }
+        #endif
         measuring.insert(source)
         Task {
             do {
@@ -319,12 +368,12 @@ struct SettingsView: View {
             .padding(12)
             .background(.bar)
         }
-        .alert("This server's certificate is not publicly trusted", isPresented: Binding(
+        .alert("This server's certificate needs your confirmation", isPresented: Binding(
             get: { model.unconfirmed != nil }, set: { if !$0 { model.unconfirmed = nil } })) {
             Button("Trust This Server") { Task { await model.confirmCertificate() } }
             Button("Cancel", role: .cancel) { model.unconfirmed = nil }
         } message: {
-            Text("Compare this fingerprint with the one on the server's dashboard:\n\n\(model.unconfirmed?.fingerprint ?? "")")
+            Text("PBS Mackup cannot verify it with the certificate authorities that macOS ships with. That is so for a certificate the server made for itself, and for one from an authority of your own, even one your Keychain trusts. Compare this fingerprint with the one on the server's dashboard:\n\n\(model.unconfirmed?.fingerprint ?? "")")
         }
         .task { await model.load() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
@@ -352,9 +401,7 @@ struct SettingsView: View {
             Section {
                 LabeledContent("Full Disk Access", value: model.fullDiskAccess ? "On" : "Off")
                 if !model.fullDiskAccess {
-                    Button("Open Full Disk Access Settings") {
-                        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
-                    }
+                    Button("Open Full Disk Access Settings") { StatusModel.openFullDiskAccess() }
                 }
             } header: {
                 Text("Permission")
@@ -371,6 +418,11 @@ struct SettingsView: View {
             Section {
                 if let key = model.status?.key, key.present {
                     LabeledContent("Key", value: key.fingerprint.map { String($0.prefix(23)) } ?? "stored")
+                    if key.foreign {
+                        Text("This key was not put into the Keychain by this app, so no backup uses it. Import the recovery copy of your own key.")
+                            .foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                        Button("Import Existing Key…") { Task { await model.importKey() } }
+                    }
                     HStack {
                         Button("Save Recovery File…") { Task { await model.saveRecoveryFile() } }
                         Button("Print Paper Key…") { Task { await model.printPaperKey() } }
@@ -405,6 +457,7 @@ struct SettingsView: View {
     private var finishHint: String {
         if model.sources.isEmpty { return "Add at least one folder to back up." }
         if model.status?.key.present != true { return "Create or import an encryption key, under Encryption Key." }
+        if model.status?.key.foreign == true { return "Import the recovery copy of your own key, under Encryption Key." }
         if model.keyIsNew && !model.recoveryExported { return "Save or print the recovery copy of the new key, under Encryption Key." }
         if model.keyIsNew && !model.recoveryConfirmed { return "Confirm that the recovery copy is stored, under Encryption Key." }
         if !model.token.isEmpty || model.accepted != model.connection { return "Test the connection, under Server." }

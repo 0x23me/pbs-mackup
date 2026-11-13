@@ -67,17 +67,13 @@ public struct FolderSizes: Codable, Equatable, Sendable {
 
     public static func load(for source: String) -> FolderSizes? {
         guard let data = try? Data(contentsOf: file(for: source)) else { return nil }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode(FolderSizes.self, from: data)).flatMap { $0.path == source ? $0 : nil }
+        return (try? JSONDecoder.iso8601.decode(FolderSizes.self, from: data)).flatMap { $0.path == source ? $0 : nil }
     }
 
     public func save() throws -> URL {
         let file = FolderSizes.file(for: path)
         try FileManager.default.createDirectory(at: Paths.sizes, withIntermediateDirectories: true)
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        try encoder.encode(self).write(to: file, options: .atomic)
+        try JSONEncoder.iso8601.encode(self).write(to: file, options: .atomic)
         // Folder names are private; the file is the owner's alone.
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
         return file
@@ -136,12 +132,12 @@ private final class Scan {
 
         var request = attrlist()
         request.bitmapcount = u_short(ATTR_BIT_MAP_COUNT)
-        // returned attributes, error, name, device, type, flags, file id
-        request.commonattr = 0x8000_0000 | 0x2000_0000 | 0x1 | 0x2 | 0x8 | 0x4_0000 | 0x0200_0000
-        // link count, logical size, size on disk
-        request.fileattr = 0x1 | 0x2 | 0x4
-        // clone id, extended flags
-        request.forkattr = 0x100 | 0x200
+        request.commonattr = attrgroup_t(ATTR_CMN_RETURNED_ATTRS) | attrgroup_t(
+            ATTR_CMN_ERROR | ATTR_CMN_NAME | ATTR_CMN_DEVID | ATTR_CMN_OBJTYPE | ATTR_CMN_FLAGS | ATTR_CMN_FILEID)
+        // ATTR_FILE_TOTALSIZE is the logical size, ATTR_FILE_ALLOCSIZE the size on disk.
+        request.fileattr = attrgroup_t(ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE)
+        // More common attributes, which go into the fork field when FSOPT_ATTR_CMN_EXTENDED is set.
+        request.forkattr = attrgroup_t(ATTR_CMNEXT_CLONEID | ATTR_CMNEXT_EXT_FLAGS)
 
         var folders: [Entry] = []
         var big: [Entry] = []
@@ -150,37 +146,38 @@ private final class Scan {
             if count <= 0 { break }
             var entry = buffer
             for _ in 0..<count {
+                // An entry is its length, the attributes it has, and then those in the order of their bits.
                 let length = Int(entry.loadUnaligned(as: UInt32.self))
                 defer { entry += length }
-                var at = entry + 4
+                var at = entry + MemoryLayout<UInt32>.size
                 func take<T>(_ type: T.Type) -> T {
                     defer { at += MemoryLayout<T>.size }
                     return at.loadUnaligned(as: T.self)
                 }
-                let common = take(UInt32.self)
-                _ = take(UInt32.self); _ = take(UInt32.self)
-                let fileAttributes = take(UInt32.self), extended = take(UInt32.self)
-                if common & 0x2000_0000 != 0, take(UInt32.self) != 0 { continue }
+                let returned = take(attribute_set_t.self)
+                func has(_ group: attrgroup_t, _ attribute: Int32) -> Bool { group & attrgroup_t(attribute) != 0 }
+                if has(returned.commonattr, ATTR_CMN_ERROR), take(UInt32.self) != 0 { continue }
                 var found = Entry()
                 var namePointer: UnsafeMutableRawPointer?
-                if common & 0x1 != 0 {
-                    namePointer = at + Int(at.loadUnaligned(as: Int32.self))
-                    at += 8
+                if has(returned.commonattr, ATTR_CMN_NAME) {
+                    // The name itself is further on: this far from where its reference stands.
+                    namePointer = at + Int(at.loadUnaligned(as: attrreference_t.self).attr_dataoffset)
+                    at += MemoryLayout<attrreference_t>.size
                 }
-                if common & 0x2 != 0 { found.device = take(dev_t.self) }
-                if common & 0x8 != 0 { found.type = take(UInt32.self) }
-                if common & 0x4_0000 != 0 { found.flags = take(UInt32.self) }
+                if has(returned.commonattr, ATTR_CMN_DEVID) { found.device = take(dev_t.self) }
+                if has(returned.commonattr, ATTR_CMN_OBJTYPE) { found.type = take(UInt32.self) }
+                if has(returned.commonattr, ATTR_CMN_FLAGS) { found.flags = take(UInt32.self) }
                 var fileID: UInt64 = 0
-                if common & 0x0200_0000 != 0 { fileID = take(UInt64.self) }
+                if has(returned.commonattr, ATTR_CMN_FILEID) { fileID = take(UInt64.self) }
                 var linkCount: UInt32 = 1, logical: Int64 = 0
-                if fileAttributes & 0x1 != 0 { linkCount = take(UInt32.self) }
-                if fileAttributes & 0x2 != 0 { logical = take(Int64.self) }
-                if fileAttributes & 0x4 != 0 { found.allocated = take(Int64.self) }
+                if has(returned.fileattr, ATTR_FILE_LINKCOUNT) { linkCount = take(UInt32.self) }
+                if has(returned.fileattr, ATTR_FILE_TOTALSIZE) { logical = take(Int64.self) }
+                if has(returned.fileattr, ATTR_FILE_ALLOCSIZE) { found.allocated = take(Int64.self) }
                 var cloneID: UInt64 = 0, extendedFlags: UInt64 = 0
-                if extended & 0x100 != 0 { cloneID = take(UInt64.self) }
-                if extended & 0x200 != 0 { extendedFlags = take(UInt64.self) }
+                if has(returned.forkattr, ATTR_CMNEXT_CLONEID) { cloneID = take(UInt64.self) }
+                if has(returned.forkattr, ATTR_CMNEXT_EXT_FLAGS) { extendedFlags = take(UInt64.self) }
 
-                if found.type == 2 {            // a directory
+                if found.type == VDIR.rawValue {
                     found.name = namePointer.map { String(cString: $0.assumingMemoryBound(to: CChar.self)) } ?? ""
                     folders.append(found)
                     continue

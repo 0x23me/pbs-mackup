@@ -13,13 +13,13 @@ public enum SampleCheck {
 
     /// Picks up to `count` regular files below `root`, at most `maxBytes` together, by walking
     /// down random folders, and prefers the most recently modified of what it found. Skips what
-    /// the backup leaves out: the default exclusions, placeholders, anything excluded from Time
-    /// Machine, and files that cannot be opened.
-    public static func pick(in root: URL, count: Int, maxBytes: Int64) -> [String] {
-        // Of the default exclusions, a name without a slash applies at any depth, one with a
-        // leading slash only from the top of the folder.
-        let excludedNames = Set(Config.defaultExcludes.filter { !$0.contains("/") })
-        let excludedPaths = Set(Config.defaultExcludes.filter { $0.hasPrefix("/") }.map { String($0.dropFirst()) })
+    /// the backup leaves out: the default exclusions and the owner's own (`excludes`),
+    /// placeholders, anything excluded from Time Machine, other volumes mounted in the folder,
+    /// and files that cannot be opened.
+    public static func pick(in root: URL, count: Int, maxBytes: Int64, excludes: [String] = []) -> [String] {
+        let rules = Config.defaultExcludes + excludes
+        var top = stat()
+        guard stat(root.path, &top) == 0 else { return [] }
         var found: [String: (size: Int64, modified: timespec)] = [:]
         for _ in 0..<(count * 6) {
             var relative: [String] = []
@@ -27,10 +27,15 @@ public enum SampleCheck {
                 let folder = relative.reduce(root) { $0.appendingPathComponent($1) }
                 guard let name = (try? FileManager.default.contentsOfDirectory(atPath: folder.path))?.randomElement() else { break }
                 relative.append(name)
-                if excludedNames.contains(name) || excludedPaths.contains(relative.joined(separator: "/")) { break }
+                // Judged at every step down, so a rule for a folder also covers what is in it.
+                let below = relative.joined(separator: "/")
+                if rules.contains(where: { LeaveOut.matches($0, relative: below) }) { break }
+                // At the top the client keeps the rules it was given under this name and never
+                // reads a file called so.
+                if below == ".pxarexclude-cli" { break }
                 let path = folder.appendingPathComponent(name).path
                 var info = stat()
-                guard lstat(path, &info) == 0, info.st_flags & UInt32(SF_DATALESS) == 0,
+                guard lstat(path, &info) == 0, info.st_dev == top.st_dev, info.st_flags & UInt32(SF_DATALESS) == 0,
                       getxattr(path, timeMachineExclusion, nil, 0, 0, XATTR_NOFOLLOW) < 0 else { break }
                 if info.st_mode & S_IFMT == S_IFDIR { continue }
                 if info.st_mode & S_IFMT == S_IFREG, info.st_size <= maxBytes {
@@ -50,6 +55,49 @@ public enum SampleCheck {
             bytes += file.size
         }
         return picked
+    }
+
+    /// Whether the picker can go by `rule`: whether `LeaveOut.matches` leaves out at least what
+    /// the client leaves out for it. Not so for `**`, which it judges loosely; for `[…]`, which
+    /// the client reads its own way; and for a rule the client tidies up before it uses it
+    /// (`./name`, `a//b`, `..`). A rule that starts with `!` only ever keeps more in the
+    /// backup, which does the picker no harm.
+    static func canJudge(_ rule: String) -> Bool {
+        if rule.hasPrefix("!") { return true }
+        // A character after a backslash stands for itself, whatever it is.
+        var plain = "", escaped = false
+        for character in rule {
+            if escaped { plain.append("x"); escaped = false }
+            else if character == "\\" { escaped = true }
+            else { plain.append(character) }
+        }
+        let parts = plain.split(separator: "/", omittingEmptySubsequences: false)
+        return !plain.contains("**") && !plain.contains("[")
+            && !parts.contains(".") && !parts.contains("..") && !parts.dropFirst().dropLast().contains("")
+    }
+
+    /// Whether the snapshot may rightly lack a picked file although no rule the picker knows
+    /// leaves it out. That is so below a folder with rules of its own (a `.pxarexclude` file,
+    /// which the client obeys), and, when the live folders were read (`liveSince` is when the
+    /// run began), for a file that came since or lies in a folder that did: the client may have
+    /// been there before it.
+    static func mayBeAbsent(_ relative: String, in root: URL, liveSince start: Date?) -> Bool {
+        func isSince(_ time: timespec) -> Bool {
+            start.map { Double(time.tv_sec) + Double(time.tv_nsec) / 1e9 >= $0.timeIntervalSince1970 } ?? false
+        }
+        var item = root, info = stat()
+        // Whether something came into the folder at hand, or left it.
+        var folderChanged = lstat(root.path, &info) == 0 && isSince(info.st_mtimespec)
+        for name in relative.split(separator: "/") {
+            if FileManager.default.fileExists(atPath: item.appendingPathComponent(".pxarexclude").path) { return true }
+            item.appendPathComponent(String(name))
+            guard lstat(item.path, &info) == 0 else { return start != nil }     // and gone again
+            // Made, moved here or renamed: that sets the change time of the item, also when
+            // it keeps an old modification date, and the modification date of its folder.
+            if folderChanged && isSince(info.st_ctimespec) { return true }
+            folderChanged = isSince(info.st_mtimespec)
+        }
+        return false
     }
 
     /// What differs between a file and its restored copy, in words; empty when nothing does.
