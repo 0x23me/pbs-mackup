@@ -18,24 +18,34 @@ public final class Child {
     public let errors: FileHandle?
     /// This side's ends of the input pipes, and what is still to be written to each.
     private var inputs: [(descriptor: Int32, data: Data)]
+    /// This side of the terminal that is the program's standard input, with `terminal`.
+    private let terminal: Int32?
     private var status: Int32?
     private let lock = NSLock()
 
     /// Starts `executable`. Without an `environment` the program gets this one's. `input` is
     /// what it finds to read on its descriptors, by number; 0 is standard input, which is
     /// empty when nothing is given for it. With `sendingInput: false` nothing is written until
-    /// `sendInput` is called, and a program that reads its input waits for that.
+    /// `sendInput` is called, and a program that reads its input waits for that. With
+    /// `terminal` the standard input is a terminal that nobody types into, for a program that
+    /// wants one before it reads what it is given on another descriptor.
     public init(_ executable: URL, _ arguments: [String], environment: [String: String]? = nil,
-                input: [Int32: Data] = [:], mergingErrors: Bool = false, sendingInput: Bool = true) throws {
+                input: [Int32: Data] = [:], mergingErrors: Bool = false, sendingInput: Bool = true,
+                terminal: Bool = false) throws {
         precondition(input.keys.allSatisfy { $0 == 0 || $0 > 2 }, "1 and 2 are the program's output")
+        precondition(!terminal || input[0] == nil, "the terminal is the standard input")
         var actions: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&actions)
         var theirs: [Int32] = [], mine: [Int32] = []
         var started = false
+        var primary: Int32 = -1
         defer {
             posix_spawn_file_actions_destroy(&actions)
             theirs.forEach { close($0) }
-            if !started { mine.forEach { close($0) } }
+            if !started {
+                mine.forEach { close($0) }
+                if primary >= 0 { close(primary) }
+            }
         }
         /// Makes a pipe, puts the child's end at `numbers` there and returns this side's end.
         func pipe(childReads: Bool, at numbers: [Int32]) throws -> Int32 {
@@ -56,7 +66,18 @@ public final class Child {
             for number in numbers { posix_spawn_file_actions_adddup2(&actions, end, number) }
             return own
         }
-        if input[0] == nil { posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0) }
+        if terminal {
+            // This side stays open until the program is forgotten: without it, its side is no terminal.
+            primary = posix_openpt(O_RDWR | O_NOCTTY)
+            guard primary >= 0 else { throw Child.failure(executable, errno) }
+            _ = fcntl(primary, F_SETFD, FD_CLOEXEC)
+            guard grantpt(primary) == 0, unlockpt(primary) == 0, let name = ptsname(primary) else {
+                throw Child.failure(executable, errno)
+            }
+            posix_spawn_file_actions_addopen(&actions, 0, name, O_RDWR | O_NOCTTY, 0)
+        } else if input[0] == nil {
+            posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        }
         var inputs: [(descriptor: Int32, data: Data)] = []
         for (number, data) in input { inputs.append((try pipe(childReads: true, at: [number]), data)) }
         let out = try pipe(childReads: false, at: mergingErrors ? [1, 2] : [1])
@@ -89,6 +110,7 @@ public final class Child {
         started = true
         self.pid = pid
         self.inputs = inputs
+        self.terminal = terminal ? primary : nil
         output = FileHandle(fileDescriptor: out, closeOnDealloc: true)
         errors = err.map { FileHandle(fileDescriptor: $0, closeOnDealloc: true) }
         if sendingInput { sendInput() }
@@ -98,7 +120,10 @@ public final class Child {
         Client.Failure(description: "\(executable.path) could not be started: \(String(cString: strerror(code)))")
     }
 
-    deinit { closeInput() }
+    deinit {
+        closeInput()
+        if let terminal { close(terminal) }
+    }
 
     /// Writes each input and closes its descriptor.
     public func sendInput() { endInput(writing: true) }

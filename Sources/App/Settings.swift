@@ -49,6 +49,11 @@ final class SettingsModel: ObservableObject {
     @Published var keyIsNew = false
     @Published var recoveryExported = false
     @Published var recoveryConfirmed = false
+    /// A key file to import that is locked with a passphrase, while the passphrase is asked
+    /// for, and why the last try to unlock it failed. Only ever in memory.
+    @Published var lockedKey: Data?
+    @Published var passphrase = ""
+    @Published var unlockError = ""
 
     private var stored: Config?
     /// The stored settings are not the ones this app saved: another program wrote config.json.
@@ -310,11 +315,42 @@ final class SettingsModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.message = "Choose the recovery copy of your encryption key."
         guard panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url) else { return }
+        if KeyStore.isLocked(data) {
+            lockedKey = data        // the sheet asks for the passphrase
+            passphrase = ""
+            unlockError = ""
+            return
+        }
         await work {
             _ = try await RunTool.call(["set-key"], input: data)
             keyIsNew = false
             await refreshStatus()
         }
+    }
+
+    /// Has the run tool take the passphrase off the key file and store the key without it.
+    func unlockKey() async {
+        guard let key = lockedKey, !passphrase.isEmpty else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            // As `pbs-mackup-run unlock-key` takes it.
+            struct Locked: Encodable { let key: String, passphrase: String }
+            let input = try JSONEncoder().encode(Locked(key: String(decoding: key, as: UTF8.self), passphrase: passphrase))
+            _ = try await RunTool.call(["unlock-key"], input: input)
+            cancelUnlock()
+            keyIsNew = false
+            await refreshStatus()
+        } catch {
+            unlockError = "\(error)"
+            passphrase = ""
+        }
+    }
+
+    func cancelUnlock() {
+        lockedKey = nil
+        passphrase = ""
+        unlockError = ""
     }
 
     func saveRecoveryFile() async {
@@ -452,6 +488,31 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .sheet(isPresented: Binding(get: { model.lockedKey != nil }, set: { if !$0 { model.cancelUnlock() } })) {
+            passphraseSheet
+        }
+    }
+
+    private var passphraseSheet: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("This key file has a passphrase").font(.headline)
+            Text("Type it once. The key is then stored without it and the Keychain protects it, so that a backup that runs by itself can use it. The file keeps its passphrase.")
+                .fixedSize(horizontal: false, vertical: true)
+            SecureField("Passphrase", text: $model.passphrase)
+                .onSubmit { Task { await model.unlockKey() } }
+            if !model.unlockError.isEmpty {
+                Text(model.unlockError).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                if model.busy { ProgressView().controlSize(.small) }
+                Spacer()
+                Button("Cancel", role: .cancel) { model.cancelUnlock() }.keyboardShortcut(.cancelAction)
+                Button("Import Key") { Task { await model.unlockKey() } }
+                    .keyboardShortcut(.defaultAction).disabled(model.busy || model.passphrase.isEmpty)
+            }
+        }
+        .padding(20)
+        .frame(width: 440)
     }
 
     private var finishHint: String {

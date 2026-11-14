@@ -24,6 +24,29 @@ public enum KeyStore {
         let created: String?
         /// How the key is unlocked with a passphrase; null in a key file that has none.
         let kdf: Anything?
+        /// What the owner wrote down to remember the passphrase by, if anything.
+        let hint: String?
+    }
+
+    /// The key file in `data`. A typed-in paper key may still have its marker lines and the
+    /// text around them; they are taken off.
+    private static func keyFile(_ data: Data) throws -> (data: Data, file: KeyFile) {
+        var data = data
+        let text = String(decoding: data, as: UTF8.self)
+        if let begin = text.range(of: "-----BEGIN PROXMOX BACKUP KEY-----"), let end = text.range(of: "-----END PROXMOX BACKUP KEY-----") {
+            data = Data(text[begin.upperBound..<end.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines).utf8)
+        }
+        guard let file = try? JSONDecoder().decode(KeyFile.self, from: data) else {
+            throw Failure(description: "This is not an encryption key file.")
+        }
+        return (data, file)
+    }
+
+    /// Whether `data` is a key file that is locked with a passphrase; false also for what is
+    /// no key file at all.
+    public static func isLocked(_ data: Data) -> Bool {
+        guard let file = try? keyFile(data).file else { return false }
+        return file.kdf != nil
     }
 
     public static func status() throws -> Status {
@@ -70,28 +93,77 @@ public enum KeyStore {
     }
 
     /// Stores a key file, such as the recovery copy made on another Mac. A key file that is
-    /// locked with a passphrase is refused: the client would ask for it at every backup, and a
-    /// backup that runs by itself has nobody to ask.
+    /// locked with a passphrase is refused here: the client would ask for it at every backup,
+    /// and a backup that runs by itself has nobody to ask. `importKey(_:passphrase:client:)`
+    /// takes it off first.
     public static func importKey(_ data: Data) throws -> Status {
-        // A typed-in paper key may still have its marker lines and the text around them.
-        var data = data
-        let text = String(decoding: data, as: UTF8.self)
-        if let begin = text.range(of: "-----BEGIN PROXMOX BACKUP KEY-----"), let end = text.range(of: "-----END PROXMOX BACKUP KEY-----") {
-            data = Data(text[begin.upperBound..<end.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines).utf8)
-        }
-        guard let file = try? JSONDecoder().decode(KeyFile.self, from: data) else {
-            throw Failure(description: "This is not an encryption key file.")
-        }
+        let (data, file) = try keyFile(data)
         guard file.kdf == nil else {
             throw Failure(description: """
                 This key file is locked with a passphrase, and a backup that runs by itself cannot ask for one. \
-                Make a copy of the file, take the passphrase off the copy with \
-                “proxmox-backup-client key change-passphrase <copy> --kdf none” and import the copy. \
-                The Keychain protects the key from then on.
+                Import it in Settings, which asks for the passphrase and stores the key without it \
+                (or with pbs-mackup-run unlock-key).
                 """)
         }
         try Keychain.set(.encryptionKey, data)
         return try status()
+    }
+
+    /// Stores a key file that is locked with a passphrase, as `importKey` stores one that is
+    /// not, once the client has taken the passphrase off. The Keychain protects the key from
+    /// then on. The locked file and the unlocked one pass through a folder only the owner can
+    /// enter (`withScratchFile`) and are gone when this returns. The passphrase goes to the
+    /// client on a descriptor of its own, never in its arguments or its environment, and only
+    /// once the started client has shown it is the one the app's developer signed, as with
+    /// `Client.start`. Errors never quote the client's output.
+    public static func importKey(_ data: Data, passphrase: String, client: URL) throws -> Status {
+        let (data, file) = try keyFile(data)
+        guard file.kdf != nil else { return try importKey(data) }
+        // The client reads the first line of the descriptor and takes nothing shorter than five bytes.
+        guard !passphrase.contains(where: \.isNewline) else { throw Failure(description: "A passphrase is one line.") }
+        let wrong = "The passphrase is wrong." + (file.hint.map { " The key file's hint: \($0)" } ?? "")
+        guard passphrase.utf8.count >= 5 else { throw Failure(description: wrong) }
+        let requirement = try Client.requirement()
+        if let requirement, !Signature.isSigned(client, as: requirement) {
+            throw Failure(description: "\(client.path) is not signed the way this app's developer signs its client, so it unlocked no key. Install the app again.")
+        }
+        let unlocked: Data = try withScratchFile { path in
+            let descriptor = open(path.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+            guard descriptor >= 0 else { throw Failure(description: "The key file could not be passed on: \(String(cString: strerror(errno))).") }
+            let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+            try handle.write(contentsOf: data)
+            try handle.close()
+
+            // `key change-passphrase` wants a terminal on its standard input, even when it is
+            // told where else to read the old passphrase; with `--kdf none` it asks for no new one.
+            var environment = Client.environment()
+            environment["PBS_ENCRYPTION_PASSWORD_FD"] = "3"
+            let child = try Child(client, ["key", "change-passphrase", path.path, "--kdf", "none"], environment: environment,
+                                  input: [3: Data((passphrase + "\n").utf8)], mergingErrors: true, sendingInput: false, terminal: true)
+            if let requirement {
+                guard let running = Signature.running(child.pid), Signature.isSigned(running, as: requirement) else {
+                    child.closeInput()
+                    child.signal(SIGKILL)
+                    child.wait()
+                    throw Failure(description: "The client that started is not signed the way this app's developer signs its client. It was stopped before it got the passphrase.")
+                }
+            }
+            child.sendInput()
+            // Should it ever wait for the terminal after all, nobody would type there.
+            DispatchQueue.global().asyncAfter(deadline: .now() + 120) { child.signal(SIGKILL) }
+            let result = child.finish()
+            guard result.status == 0 else {
+                let said = String(decoding: result.output, as: UTF8.self)
+                if said.contains("Unable to decrypt key") || said.contains("Passphrase is too short") { throw Failure(description: wrong) }
+                if said.contains("wrong fingerprint") { throw Failure(description: "The key in this file does not have the fingerprint the file names.") }
+                throw Failure(description: "The client could not unlock the key (exit status \(result.status)).")
+            }
+            guard let key = try? Data(contentsOf: path), let unlocked = try? keyFile(key).file, unlocked.kdf == nil else {
+                throw Failure(description: "The client did not leave an unlocked key.")
+            }
+            return key
+        }
+        return try importKey(unlocked)
     }
 
     /// Writes the recovery copy: the key file itself, readable by the owner only from the

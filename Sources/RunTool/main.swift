@@ -196,6 +196,18 @@ let commands: [Command] = [
                 try confirmKeyChange(call)
                 return try json(KeyStore.importKey(call.input()))
             }),
+    Command(name: "unlock-key",
+            what: #"store the key file that is locked with a passphrase, from standard input as {"key":"…","passphrase":"…"}, without the passphrase"#,
+            run: .plain { call in
+                /// `key` is the text of the key file, or of a paper key.
+                struct Locked: Decodable { let key: String, passphrase: String }
+                guard let locked = try? JSONDecoder().decode(Locked.self, from: call.input()) else {
+                    throw Failure(description: #"Standard input should be {"key":"…","passphrase":"…"}, with the text of the key file."#)
+                }
+                try confirmKeyChange(call)
+                return try json(KeyStore.importKey(Data(locked.key.utf8), passphrase: locked.passphrase,
+                                                   client: Client.executable(clientPath: (try? Config.load())?.clientPath)))
+            }),
     Command(name: "create-key", arguments: "[--replace]", count: 0...1,
             what: "make a new encryption key (refused when one exists, unless --replace)",
             run: .plain { call in

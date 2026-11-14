@@ -77,8 +77,8 @@ The app lives in the menu bar. Settings has three tabs:
    it somewhere that isn't this Mac. Without the key or that copy nobody can read the backups,
    you included. After a reinstall, import the copy. Saving the recovery file, printing the
    paper key and replacing the key ask for Touch ID or your password. A key file that has a
-   passphrase can't be imported; take it off a copy first with `proxmox-backup-client key
-   change-passphrase <copy> --kdf none`.
+   passphrase asks for it once; the key is then stored without it, since a backup that runs by
+   itself has nobody to ask. The file keeps its passphrase.
 3. **What to Back Up.** Starts with your whole home folder. Untick folders, take the
    suggestions (`node_modules`, build folders, caches), or add a name (`*.iso`) or a path.
    Pick how often to back up. A folder has to be on the Mac's own disk, and two folders of the

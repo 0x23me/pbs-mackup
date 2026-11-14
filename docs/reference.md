@@ -35,7 +35,7 @@ the place to start.
 | `~/Library/Application Support/pbs-mackup/paused` | an empty file that is there while automatic backups are paused; the app makes and removes it, the run tool only looks for it |
 | `~/Library/Application Support/pbs-mackup/logs/` | one log per run, kept for 30 days |
 | `~/Library/Caches/pbs-mackup/` | the run lock, the backups opened in Finder (`browse`), the files opened from a backup to look at (`preview`, removed when the Backups window closes and when the app quits or starts), the names in the snapshots that were searched (`index`, removed two weeks after the last use), the last measurement of each backed-up folder (`sizes`, folder names and sizes), and during a run the list of changed folders (`changed-folders`) and a marker file for the change log (`changes`) |
-| `~/Library/Group Containers/<Team ID>.<bundle identifier>/` | what no other program is to read or write. macOS asks the owner before it lets a program of another developer into this folder. `mnt` is where a run mounts its APFS snapshot, with its copy of Mail, Messages and the like; `check-…` holds the files a run restores to compare them, `key-…` a new key on its way into the Keychain, both only for a moment. `seal.json` is what the app and the run tool last stored themselves, as two digests: of the configuration and of the encryption key. An app built without a developer's identity has no such folder: it keeps the seal with `config.json` and the rest in the cache, where they are open to every program of the user |
+| `~/Library/Group Containers/<Team ID>.<bundle identifier>/` | what no other program is to read or write. macOS asks the owner before it lets a program of another developer into this folder. `mnt` is where a run mounts its APFS snapshot, with its copy of Mail, Messages and the like; `check-…` holds the files a run restores to compare them, `key-…` a new or imported key on its way into the Keychain, both only for a moment. `seal.json` is what the app and the run tool last stored themselves, as two digests: of the configuration and of the encryption key. An app built without a developer's identity has no such folder: it keeps the seal with `config.json` and the rest in the cache, where they are open to every program of the user |
 | login Keychain, service `<bundle identifier>.tool` | the API token secret (`token`) and the encryption key (`encryption-key`). The Keychain hands them to the run tool, which signs under that name. Versions before 0.2 kept them under the bundle identifier itself; 0.2 moves them when the app first starts, and macOS asks for the login password for each |
 
 `config.json`:
@@ -82,7 +82,12 @@ were read and the file arrived after the run began.
 
 The secrets are stored with `pbs-mackup-run set-token` and `pbs-mackup-run set-key`, each
 reading standard input and each asking for Touch ID or the login password first. `set-key`
-refuses a key file that is locked with a passphrase.
+refuses a key file that is locked with a passphrase; `unlock-key` takes it, as
+`{"key": "…", "passphrase": "…"}` on standard input with the text of the key file or of the paper
+key. The client's `key change-passphrase --kdf none` takes the passphrase off, in a `key-…`
+folder that is removed right after, and the key is stored without it. The client gets the
+passphrase on a descriptor of its own (`PBS_ENCRYPTION_PASSWORD_FD`), never in its arguments or
+environment. The settings window asks for the passphrase when the chosen file has one.
 
 ## How sizes are measured
 
@@ -126,8 +131,8 @@ takes everything mounted this way. A snapshot is named
 
 Without an argument it does one scheduled run, `--manual` one that ignores the interval and
 the battery, `--full` one that also reads every folder. `status` prints the state file (not
-whether backups are paused: that is the file `paused`), `set-token` and `set-key` store a
-secret from standard input in the Keychain.
+whether backups are paused: that is the file `paused`), `set-token`, `set-key` and `unlock-key`
+store a secret from standard input in the Keychain.
 
 `accept` reads `{"config": {…}, "token": "…"}` from standard input (the configuration as in
 `config.json`; `token` only for a new one), asks the server, and stores both only when the
@@ -135,7 +140,7 @@ server accepts them. The settings window saves through it.
 
 `export-key <file>` writes the recovery copy of the key, readable by you only, and `paper-key`
 prints it as text; both ask for Touch ID or the login password first, also when the app asks for
-them, and so do `create-key --replace` and a `set-key` that replaces a key. `seal` makes a
+them, and so do `create-key --replace` and a `set-key` or `unlock-key` that replaces a key. `seal` makes a
 `config.json` that was edited by hand the one to go by. `migrate` moves the token and the key
 that a version before 0.2 stored; the app asks for it when it starts. `serve` is the helper job:
 it answers the app until launchd stops it. `certificate <host> <port>` prints the server
