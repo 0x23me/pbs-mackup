@@ -155,6 +155,8 @@ A folder that was moved or renamed is read with everything below it. Everything 
   change log stood;
 - macOS started the log over, or reports a gap or lost events;
 - the log doesn't answer within two minutes;
+- the last successful run that read everything began more than seven days ago, or none is on
+  record;
 - the run was started with `--full`.
 
 ## State file
@@ -172,6 +174,7 @@ watches the folder and reads the file whenever it was replaced. Dates are ISO 86
 | `lastSuccess` | the record of the most recent successful run |
 | `consecutiveFailures` | failed runs since the last success; skipped and cancelled runs neither count nor reset it |
 | `changeBase` | what the next run needs to read only what changed: `position` (the change log's `event` number and the `log` it belongs to, noted before the last successful run took its snapshot), `snapshot` (the backup that run made) and `settings` (a digest of folders, exclusions and client). Absent after a run that failed its sample check and after one that could not note a position: the next run reads everything |
+| `lastFullRead` | when the last successful run began that read everything, from the start or because the client set the list of changes aside. A run reads everything when it is more than seven days ago or absent |
 | `history` | the last 100 records, oldest first |
 
 `running`:

@@ -142,6 +142,9 @@ public struct State: Codable, Equatable {
     public var lastSuccess: RunRecord?
     public var consecutiveFailures = 0
     public var changeBase: ChangeBase?
+    /// When the last successful run began that read everything. Nil in a state file from
+    /// before it was noted, which the next run takes as none on record.
+    public var lastFullRead: Date?
     public var history: [RunRecord] = []
     /// Not in use any more: the pause is a file of its own, see `Pause`. A `true` from before
     /// that is moved there by the next run. The field is still written, as `false`, for an

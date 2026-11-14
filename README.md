@@ -131,8 +131,8 @@ Linux refuses on symlinks.
 After the first backup a run asks macOS what changed since the last one (FSEvents, the log
 Time Machine uses) and reads only those folders. It reads everything when the log has a gap
 or the settings changed; the cases are in [docs/reference.md](docs/reference.md). Apple
-calls the log advisory and recommends a full read now and then. There is no scheduled one
-yet, so do it by hand:
+calls the log advisory and recommends a full read now and then, so a run also reads
+everything when the last full read is more than seven days ago. To read everything now:
 
 ```sh
 /Applications/PBSMackup.app/Contents/MacOS/pbs-mackup-run --full

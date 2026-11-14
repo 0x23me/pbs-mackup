@@ -171,6 +171,11 @@ public final class Runner {
         state.changeBase = position.flatMap { position in
             output.snapshot.map { ChangeBase(position: position, snapshot: $0, settings: settings) }
         }
+        // A run that read everything, because there was no list of changes or the client set
+        // it aside, is the full read the next ones count from.
+        if plan.base == nil || output.result.changeList?.hasPrefix("ignored") == true {
+            state.lastFullRead = start
+        }
         return finish(.success, reason: nil, step: nil, frozen: frozen, output: output, check: check)
     }
 
@@ -231,6 +236,13 @@ public final class Runner {
         now.timeIntervalSince(state.nextRun(intervalMinutes: intervalMinutes)) >= -30
     }
 
+    /// The change log is advisory, so a run reads everything once the last full read is more
+    /// than seven days old. Returns why, or nil when it is not due.
+    static func fullReadOverdue(_ state: State, now: Date) -> String? {
+        guard let last = state.lastFullRead else { return "no full read on record" }
+        return now.timeIntervalSince(last) > 7 * 24 * 3600 ? "the last full read is more than seven days old" : nil
+    }
+
     /// What decides the content of a backup besides the files: when any of it changes,
     /// folders taken over from the previous backup could be wrong.
     private func settingsDigest(client: Client) -> String {
@@ -246,6 +258,7 @@ public final class Runner {
     private func changedFolders(root: String, settings: String) -> (base: String?, note: String) {
         if readEverything { return (nil, "everything read: asked to") }
         guard let base = state.changeBase else { return (nil, "everything read: no earlier backup to build on") }
+        if let overdue = Runner.fullReadOverdue(state, now: start) { return (nil, "everything read: \(overdue)") }
         guard base.settings == settings else { return (nil, "everything read: folders, exclusions or the client changed") }
         guard let time = base.snapshot.split(separator: "/").last else { return (nil, "everything read: no earlier backup to build on") }
         let roots = config.sources.map(realPath)

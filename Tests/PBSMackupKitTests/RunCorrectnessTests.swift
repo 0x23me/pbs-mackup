@@ -2,8 +2,8 @@ import Foundation
 import Testing
 @testable import PBSMackupKit
 
-// When a run is due, what it takes for the next one to build on, what the sample check picks
-// and forgives, whether a recorded run is still going, and the pause.
+// When a run is due, when it reads everything, what it takes for the next one to build on,
+// what the sample check picks and forgives, whether a recorded run is still going, and the pause.
 
 private func record(_ outcome: Outcome, at start: Date, took seconds: Double = 60, trigger: Trigger = .scheduled,
                     reason: String? = nil) -> RunRecord {
@@ -95,6 +95,31 @@ private func failing(intervalMinutes: Int, forMinutes span: Int) -> (runs: [Int]
     let hourly = failing(intervalMinutes: 60, forMinutes: 240)
     #expect(hourly.runs == [0, 20, 55, 120, 185])
     #expect(hourly.notice == 55)
+}
+
+// MARK: - When a run reads everything
+
+@Test func aRunReadsEverythingOnceTheLastFullReadIsMoreThanAWeekOld() {
+    let start = Date(timeIntervalSince1970: 1_800_000_000), day: TimeInterval = 24 * 3600
+    var state = State()
+    #expect(Runner.fullReadOverdue(state, now: start) != nil)                                  // none on record
+    state.lastFullRead = start
+    #expect(Runner.fullReadOverdue(state, now: start.addingTimeInterval(6 * day)) == nil)
+    #expect(Runner.fullReadOverdue(state, now: start.addingTimeInterval(7 * day)) == nil)      // exactly a week is not more
+    #expect(Runner.fullReadOverdue(state, now: start.addingTimeInterval(7 * day + 1)) != nil)
+}
+
+@Test func aStateFileFromBeforeFullReadsWereNotedHasNoneOnRecord() throws {
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("pbs-mackup-state-\(UUID().uuidString).json")
+    defer { try? FileManager.default.removeItem(at: file) }
+    var old = State()
+    old.finish(record(.success, at: Date(timeIntervalSince1970: 1_800_000_000)))
+    try old.save(to: file)
+    #expect(!String(decoding: try Data(contentsOf: file), as: UTF8.self).contains("lastFullRead"))
+    let state = State.load(from: file)
+    #expect(state.last == old.last)                 // the file was read, not replaced by an empty state
+    #expect(state.lastFullRead == nil)
+    #expect(Runner.fullReadOverdue(state, now: Date()) != nil)
 }
 
 // MARK: - Whether a recorded run is still going
