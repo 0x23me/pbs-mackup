@@ -34,6 +34,8 @@ final class SettingsModel: ObservableObject {
     @Published var fullDiskAccess = FullDiskAccess.granted
     @Published var busy = false
     @Published var message = ""
+    /// Why the last action on the Encryption Key tab failed; that tab shows it, the others `message`.
+    @Published var keyMessage = ""
     /// What the server was last asked about and accepted; Done needs it to be the current values.
     @Published var accepted: Connection?
     struct Connection: Equatable { var repository, namespace, backupID: String, fingerprint: String? }
@@ -209,10 +211,15 @@ final class SettingsModel: ObservableObject {
         measured[source] = nil
     }
 
-    private func work(_ body: () async throws -> Void) async {
+    /// Runs an action and puts why it failed in `message`, or for an action on the key in
+    /// `keyMessage`, which is cleared first.
+    private func work(onKey: Bool = false, _ body: () async throws -> Void) async {
         busy = true
         defer { busy = false }
-        do { try await body() } catch { message = "\(error)" }
+        if onKey { keyMessage = "" }
+        do { try await body() } catch {
+            if onKey { keyMessage = "\(error)" } else { message = "\(error)" }
+        }
     }
 
     /// Checks the certificate, then lets the server judge repository, namespace and token. The
@@ -302,7 +309,7 @@ final class SettingsModel: ObservableObject {
 
     /// `replacing` an existing key: earlier backups then need the old key's recovery copy.
     func createKey(replacing: Bool = false) async {
-        await work {
+        await work(onKey: true) {
             _ = try await RunTool.call(["create-key"] + (replacing ? ["--replace"] : []))
             keyIsNew = true
             recoveryExported = false
@@ -321,7 +328,7 @@ final class SettingsModel: ObservableObject {
             unlockError = ""
             return
         }
-        await work {
+        await work(onKey: true) {
             _ = try await RunTool.call(["set-key"], input: data)
             keyIsNew = false
             await refreshStatus()
@@ -358,14 +365,14 @@ final class SettingsModel: ObservableObject {
         panel.nameFieldStringValue = "pbs-backup-key-\(backupID).json"
         panel.message = "Keep this file somewhere other than this Mac, for example in your password manager."
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        await work {
+        await work(onKey: true) {
             _ = try await RunTool.call(["export-key", url.path])
             recoveryExported = true
         }
     }
 
     func printPaperKey() async {
-        await work {
+        await work(onKey: true) {
             let text = try await RunTool.decode([String: String].self, ["paper-key"])["text"] ?? ""
             let view = NSTextView(frame: NSRect(x: 0, y: 0, width: 520, height: 720))
             view.font = .monospacedSystemFont(ofSize: 9, weight: .regular)
@@ -479,6 +486,9 @@ struct SettingsView: View {
                         Button("Create New Key") { Task { await model.createKey() } }
                         Button("Import Existing Key…") { Task { await model.importKey() } }
                     }
+                }
+                if !model.keyMessage.isEmpty {
+                    Text(model.keyMessage).font(.callout).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
                 }
             } header: {
                 Text("Encryption key")
