@@ -310,6 +310,7 @@ struct RunToolTests {
         #expect(utimes(fixture.home.path + "/Source/" + named, &times) == 0)
         var config = try Config.load()
         config.excludes += [rule, "-dash"]
+        config.macSettings = true
         try config.save()
 
         let result = try fixture.run("ok")
@@ -328,6 +329,9 @@ struct RunToolTests {
         let noted = try Data(contentsOf: fixture.home.appendingPathComponent("client-arguments"))
         let arguments = String(decoding: noted, as: UTF8.self)
         #expect(arguments.contains("Source.pxar:\(Paths.mount.path)/"))
+        // The settings manifest went up with it, whether or not login items could be read.
+        #expect(arguments.contains("settings.conf:\(Paths.settingsManifest.path)"))
+        #expect(!FileManager.default.fileExists(atPath: Paths.settingsManifest.path))      // and is gone from the cache
         // The default exclusions and the owner's own, encryption, change detection, a stable group.
         // Each exclusion in one piece with its option, so that one with a dash in front is no option.
         for expected in ["--exclude=.DS_Store\n", "--exclude=/Library/Caches\n", "--exclude=*.tmp\n", "--exclude=-dash\n", "--crypt-mode\nencrypt\n",

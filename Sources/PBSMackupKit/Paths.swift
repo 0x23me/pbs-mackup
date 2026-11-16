@@ -62,6 +62,8 @@ public enum Paths {
     public static var sizes: URL { cache.appendingPathComponent("sizes") }
     /// Where a run leaves a file to see how far the change log has come; see `ChangeLog`.
     public static var changeMarker: URL { cache.appendingPathComponent("changes") }
+    /// The settings manifest a run uploads as `settings.conf`, while the run lasts.
+    public static var settingsManifest: URL { cache.appendingPathComponent("settings.json") }
     /// The folders that changed since the last backup, for the client, while a run lasts.
     public static var changedFolders: URL { cache.appendingPathComponent("changed-folders") }
     /// Files opened from a backup to look at; emptied when the Backups window closes and when

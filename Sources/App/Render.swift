@@ -14,12 +14,15 @@ enum Render {
 
     static func run(_ arguments: [String]) -> Never {
         active = true
-        guard arguments.count >= 2 else { print("usage: PBSMackup --render settings|timeline <file.png>"); exit(64) }
+        guard arguments.count >= 2 else { print("usage: PBSMackup --render settings|timeline|restore|login-items <file.png>"); exit(64) }
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         let view: AnyView, size: NSSize
         switch arguments[0] {
         case "timeline": (view, size) = (AnyView(TimelineView()), NSSize(width: 940, height: 700))
+        case "login-items":
+            let preview = MainActor.assumeIsolated { LoginItemsView.preview(arguments.dropFirst(2).first) }
+            (view, size) = (AnyView(LoginItemsView(request: preview.request, preview: preview.model)), NSSize(width: 520, height: 480))
         case "restore": (view, size) = (AnyView(RestoreView(preview: RestoreView.previewState(arguments.dropFirst(2).first))), NSSize(width: 600, height: 640))
         default: (view, size) = (AnyView(SettingsView()), NSSize(width: 940, height: 700))
         }
@@ -51,6 +54,29 @@ extension RestoreView {
                             notes: ["21,781 files are now owned by your account on this Mac (uid 503 on the old Mac, 501 here).",
                                     "Sharing permissions that named you on the old Mac now name your account here (1 item).",
                                     "iCloud Drive and other cloud storage were left out. They sync again once you sign in."])
+    }
+}
+
+extension LoginItemsView {
+    /// What `--render login-items <file> [items|none|unavailable|not-allowed]` shows: every kind
+    /// of row, or one of the messages instead of them.
+    @MainActor static func preview(_ variant: String?) -> (request: LoginItemsRequest, model: LoginItemsModel) {
+        let model = LoginItemsModel()
+        let raycast = LoginItem(name: "Raycast", bundleID: "com.raycast.macos", path: "/Applications/Raycast.app")
+        let calculator = LoginItem(name: "Calculator", bundleID: "com.apple.calculator", path: "/Applications/Calculator.app")
+        let gone = LoginItem(name: "Flux", bundleID: "org.herf.Flux.missing", path: "/Applications/Flux.app")
+        switch variant {
+        case "none": model.recorded = .none
+        case "unavailable": model.recorded = .unavailable(LoginItems.reason(.notAsked)!)
+        default:
+            model.recorded = .items([raycast, calculator, gone])
+            model.current = [raycast]
+            // Calculator lives elsewhere now; it is found by its bundle identifier.
+            model.installed = [raycast: URL(fileURLWithPath: "/Applications/Raycast.app"),
+                               calculator: URL(fileURLWithPath: "/System/Applications/Calculator.app")]
+            model.permission = variant == "not-allowed" ? .notAsked : .granted
+        }
+        return (LoginItemsRequest(snapshot: "host/old-mac/2026-11-12T08:00:00Z", hasSettings: variant != "none"), model)
     }
 }
 

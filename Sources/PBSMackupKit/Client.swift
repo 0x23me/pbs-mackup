@@ -265,7 +265,7 @@ public struct Client {
         if let snapshot, !isSnapshot(snapshot) {
             throw Failure(description: "“\(snapshot)” is not a snapshot: it should look like host/my-mac/2026-11-12T14:00:05Z.")
         }
-        if let archive = archives.first(where: { !isArchive($0) }) {
+        if let archive = archives.first(where: { !isArchive($0) && $0 != settingsBlob }) {
             throw Failure(description: "“\(archive)” is not an archive: it should look like Documents.pxar.")
         }
     }
@@ -286,6 +286,8 @@ public struct Client {
         /// The archives a snapshot holds, as `<folder>.pxar`.
         public let archives: [String]
         public let size: Int64?
+        /// Whether the snapshot holds a settings manifest; older ones don't.
+        public var hasSettings = false
     }
 
     public struct Entry: Codable, Equatable, Identifiable {
@@ -322,9 +324,15 @@ public struct Client {
             let time = Date(timeIntervalSince1970: TimeInterval(raw.backupTime))
             let name = "\(raw.backupType)/\(raw.backupID)/\(formatter.string(from: time))"
             guard Client.isSnapshot(name) else { return nil }
-            return Snapshot(name: name, time: time, archives: Client.archives(in: raw.files.map(\.filename)), size: raw.size)
+            let files = raw.files.map(\.filename)
+            return Snapshot(name: name, time: time, archives: Client.archives(in: files), size: raw.size,
+                            hasSettings: files.contains(Client.settingsBlob + ".blob"))
         }.sorted { $0.time > $1.time }
     }
+
+    /// The settings manifest's name in a snapshot, as the client takes it; the server keeps it
+    /// as `settings.conf.blob`.
+    public static let settingsBlob = "settings.conf"
 
     /// The folder archives among a snapshot's files; the port's own attribute archives are left out.
     static func archives(in files: [String]) -> [String] {
@@ -335,6 +343,12 @@ public struct Client {
             }
             return nil
         }.filter(isArchive).sorted()
+    }
+
+    /// The settings manifest a snapshot holds, fetched alone; see `Snapshot.hasSettings`.
+    public func settings(snapshot: String) throws -> SettingsManifest {
+        try Client.check(snapshot: snapshot, archives: [Client.settingsBlob])
+        return try SettingsManifest.decode(capture(["restore", snapshot, Client.settingsBlob, "-"]))
     }
 
     /// One directory of an archive; `path` is relative to the archive root, empty for the root.

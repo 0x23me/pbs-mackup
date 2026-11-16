@@ -132,8 +132,11 @@ public final class Runner {
         log(plan.note)
         defer { try? FileManager.default.removeItem(at: Paths.changedFolders) }
 
+        let manifest = config.macSettingsOn ? writeSettingsManifest() : nil
+        defer { try? FileManager.default.removeItem(at: Paths.settingsManifest) }
+
         var output = ClientOutput()
-        let status = backup(root: root, client: client, changed: plan.base, output: &output)
+        let status = backup(root: root, client: client, changed: plan.base, manifest: manifest, output: &output)
         changes = output.result.changeList.flatMap { $0.hasPrefix("ignored") ? "everything read: the client \($0)" : nil } ?? plan.note
         if isCancelled {
             return finish(.cancelled, reason: nil, step: nil, frozen: frozen, output: output)
@@ -296,17 +299,41 @@ public final class Runner {
         return battery.percent < 20 ? "On battery below 20 %." : "On battery in Low Power Mode."
     }
 
-    private func backup(root: String, client: Client, changed base: String?, output: inout ClientOutput) -> Int32 {
+    /// Records the settings that live outside the backed-up folders where the client picks them
+    /// up. Returns nil when the file can't be written: the backup goes on without it.
+    private func writeSettingsManifest() -> URL? {
+        let manifest = SettingsManifest.capture()
+        log("login items: " + (manifest.loginItems.reason ?? "\(manifest.loginItems.items.count) recorded"))
+        do {
+            try manifest.encoded().write(to: Paths.settingsManifest, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Paths.settingsManifest.path)
+            return Paths.settingsManifest
+        } catch {
+            log("the settings manifest could not be written: \(error)")
+            return nil
+        }
+    }
+
+    /// The client's arguments for a backup. While Mac Settings (beta) is on, the settings manifest
+    /// goes up as `settings.conf`, a blob of its own encrypted like the archives, which
+    /// `Client.archives(in:)` leaves out.
+    static func backupArguments(config: Config, root: String, changed base: String?, manifest: URL?) -> [String] {
         var arguments = ["backup"]
         for source in config.sources {
-            let path = realPath(source)
+            let path = Config.realPath(source)
             arguments.append("\(Config.archiveName(for: path)):\(root)\(path)")
         }
+        if config.macSettingsOn, let manifest { arguments.append("\(Client.settingsBlob):\(manifest.path)") }
         arguments += ["--backup-id", config.backupID, "--change-detection-mode=metadata", "--crypt-mode", "encrypt",
                       "--progress-json", "true", "--skip-placeholders", "true", "--skip-tm-excluded", "true"]
         // In one piece with its option: on its own, a pattern that begins with a dash is read as an option.
         for pattern in Config.defaultExcludes + config.excludes { arguments.append("--exclude=\(pattern)") }
         if let base { arguments += ["--changed-dirs", Paths.changedFolders.path, "--changed-dirs-base", base] }
+        return arguments
+    }
+
+    private func backup(root: String, client: Client, changed base: String?, manifest: URL?, output: inout ClientOutput) -> Int32 {
+        let arguments = Runner.backupArguments(config: config, root: root, changed: base, manifest: manifest)
         log("client: \(client.executable.path) \(arguments.joined(separator: " "))")
 
         let child: Child

@@ -119,6 +119,9 @@ let commands: [Command] = [
     // What follows is for the app, each printing JSON; from a terminal the owner confirms first.
     Command(name: "snapshots", what: "the snapshots, newest first", confirm: "list your backups",
             run: .configured { _, config in try json(Client(config: config).snapshots()) }),
+    Command(name: "settings", arguments: "<snapshot>", count: 1...1, what: "the settings manifest of a snapshot",
+            confirm: "read the settings recorded in your backups",
+            run: .configured { call, config in try json(Client(config: config).settings(snapshot: call.arguments[1])) }),
     Command(name: "list", arguments: "<snapshot> <archive> [<path>]", count: 2...3, what: "one directory",
             confirm: "read the names in your backups",
             run: .configured { call, config in

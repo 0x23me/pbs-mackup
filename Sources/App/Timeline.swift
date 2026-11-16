@@ -389,6 +389,9 @@ final class TimelineModel: ObservableObject {
 }
 
 struct TimelineView: View {
+    @Environment(\.openWindow) private var openWindow
+    /// Beta features: whether the Mac Settings layer is on, read when the window opens.
+    @State private var macSettings = false
     /// The window's title, which is also how the view knows its own window among the app's.
     static let title = "Backups"
     @StateObject private var model = TimelineModel()
@@ -423,6 +426,16 @@ struct TimelineView: View {
                     Text(model.location).lineLimit(1).truncationMode(.head)
                     Spacer()
                     if model.busy { ProgressView().controlSize(.small) }
+                    if macSettings {
+                        Button("Mac Settings…") {
+                            if let snapshot = model.snapshot {
+                                openWindow(id: "login-items", value: LoginItemsRequest(snapshot: snapshot.name, hasSettings: snapshot.hasSettings))
+                            }
+                        }
+                        .disabled(model.snapshot == nil)
+                        .help("The settings recorded with this backup outside its files: the apps that opened at login")
+                        Divider().frame(height: 16)
+                    }
                     Button("Open in Finder") { Task { await model.openInFinder() } }
                         .disabled(model.archive == nil || model.searching || model.busy)
                     Button("Restore to Original Location") { Task { await model.restoreSelection(toOriginal: true) } }
@@ -488,6 +501,7 @@ struct TimelineView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 440)
+        .task { macSettings = (try? Config.load())?.macSettingsOn ?? false }
         .searchable(text: $model.query, placement: .toolbar, prompt: "Search this backup")
         .modifier(FindShortcut())
         .onChange(of: model.query) { model.runSearch() }

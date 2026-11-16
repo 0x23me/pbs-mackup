@@ -62,7 +62,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>NSHumanReadableCopyright</key><string>BSD-3-Clause. The client inside is AGPL-3.0, from Proxmox Backup. Not a Proxmox product.</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>LSUIElement</key><true/>
-  <key>NSAppleEventsUsageDescription</key><string>PBS Mackup logs you out at the end of a restore from a backup, so that your restored home folder can take the place of this one.</string>
+  <key>NSAppleEventsUsageDescription</key><string>PBS Mackup records the apps that open at login with each backup and adds them back after a restore, and logs you out at the end of a restore from a backup, so that your restored home folder can take the place of this one.</string>
 </dict></plist>
 PLIST
 
@@ -158,7 +158,8 @@ fi
 for name in groups mount app; do
     library=""
     [ "$name" = mount ] && library="<key>com.apple.security.cs.disable-library-validation</key><true/>"
-    # The app alone sends an Apple event: Log Out at the end of a restore, to loginwindow.
+    # The app sends Apple events: Log Out at the end of a restore, to loginwindow, and login items, to
+    # System Events. The run tool reads login items too; macOS counts it as the app's, so it needs no entitlement.
     [ "$name" = app ] && library="<key>com.apple.security.automation.apple-events</key><true/>"
     cat > ".build/$name.entitlements" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

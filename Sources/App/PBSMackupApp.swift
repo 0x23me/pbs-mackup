@@ -44,6 +44,11 @@ struct PBSMackupApp: App {
             RestoreView()
         }
         .windowResizability(.contentSize)
+
+        WindowGroup(LoginItemsView.title, id: "login-items", for: LoginItemsRequest.self) { $request in
+            if let request { LoginItemsView(request: request) }
+        }
+        .windowResizability(.contentSize)
     }
 }
 
@@ -66,6 +71,20 @@ private struct MenuBarLabel: View {
               state.phase == .done || state.phase == .failed else { return }
         openWindow(id: "restore")
         NSApp.activate(ignoringOtherApps: true)
+        if state.phase == .done { await offerLoginItems(of: state.snapshot) }
+    }
+
+    /// Once after a home restore, the login items of the restored snapshot, when Mac Settings
+    /// (beta) is on in the restored configuration and the snapshot has any.
+    /// What was offered is kept by the snapshot's name: the preferences come back with the home
+    /// folder, so a yes-or-no would come back from an earlier restore.
+    private func offerLoginItems(of snapshot: String) async {
+        let key = "loginItemsOffered"
+        guard (try? Config.load())?.macSettingsOn == true, UserDefaults.standard.string(forKey: key) != snapshot,
+              let snapshots = try? await RunTool.decode([Client.Snapshot].self, ["snapshots"]) else { return }
+        UserDefaults.standard.set(snapshot, forKey: key)
+        guard snapshots.first(where: { $0.name == snapshot })?.hasSettings == true else { return }
+        openWindow(id: "login-items", value: LoginItemsRequest(snapshot: snapshot, hasSettings: true))
     }
 }
 
@@ -245,6 +264,10 @@ final class StatusModel: ObservableObject {
 
     static func openFullDiskAccess() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
+    }
+
+    static func openAutomation() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")!)
     }
 }
 

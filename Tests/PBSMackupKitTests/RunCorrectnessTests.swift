@@ -400,3 +400,33 @@ extension PrivateHomeTests {
         }
     }
 }
+
+// MARK: - The settings manifest
+
+@Test func theSettingsManifestGoesUpWithTheFoldersAsABlobOfItsOwn() {
+    var config = Config(repository: "test@pbs!mac@127.0.0.1:0:store", namespace: "test", backupID: "test-mac",
+                        sources: ["/Users/me"])
+    let manifest = URL(fileURLWithPath: "/cache/settings.json")
+    // Mac Settings is a beta feature, off unless switched on: then only the folders go up.
+    #expect(Runner.backupArguments(config: config, root: "/mnt", changed: nil, manifest: manifest).prefix(3)
+            == ["backup", "me.pxar:/mnt/Users/me", "--backup-id"])
+    config.macSettings = true
+    let arguments = Runner.backupArguments(config: config, root: "/mnt", changed: nil, manifest: manifest)
+    #expect(arguments.prefix(3) == ["backup", "me.pxar:/mnt/Users/me", "settings.conf:/cache/settings.json"])
+    // Without a manifest the backup goes on as before.
+    #expect(!Runner.backupArguments(config: config, root: "/mnt", changed: nil, manifest: nil).contains { $0.hasPrefix("settings.conf") })
+}
+
+@Test func aCaptureThatFailsOrHangsIsRecordedAsUnavailable() {
+    struct Refused: Error, CustomStringConvertible { var description: String { "not allowed" } }
+    #expect(SettingsManifest.capture(loginItems: { throw Refused() }).loginItems == .unavailable("not allowed"))
+
+    let started = Date()
+    let slow = SettingsManifest.capture(timeout: 0.2, loginItems: { Thread.sleep(forTimeInterval: 2); return [] })
+    #expect(Date().timeIntervalSince(started) < 1)
+    #expect(slow.loginItems.status == .unavailable)
+    #expect(slow.loginItems.reason?.contains("didn't answer") == true)
+
+    let item = LoginItem(name: "Raycast", bundleID: "com.raycast.macos", path: "/Applications/Raycast.app")
+    #expect(SettingsManifest.capture(loginItems: { [item] }).loginItems == .ok([item]))
+}

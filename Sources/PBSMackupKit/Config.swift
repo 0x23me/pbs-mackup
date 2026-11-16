@@ -32,6 +32,11 @@ public struct Config: Codable, Equatable {
     /// How often a backup is made, in minutes; hourly when absent.
     public var intervalMinutes: Int?
     public var interval: Int { max(5, intervalMinutes ?? 60) }
+    /// Beta features: the Mac Settings layer, which records settings outside the backed-up folders (so
+    /// far the login items) with each backup. Off when absent; never written as false, so a
+    /// configuration from before it keeps its seal.
+    public var macSettings: Bool?
+    public var macSettingsOn: Bool { macSettings == true }
 
     public init(repository: String, namespace: String, backupID: String, sources: [String],
                 excludes: [String] = [], frozenSnapshot: FrozenSnapshot = .whenPermitted, clientPath: String? = nil) {

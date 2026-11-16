@@ -133,10 +133,29 @@ or Touch ID. From a terminal, the same works with `sudo pbs-mackup-run restore-h
 'mac@pbs!backup@pbs.example.net:store' key.json --ns mac`, run from another administrator's
 account while `me` is logged out.
 
+With [Mac Settings](#mac-settings-beta) switched on, the app then offers to add your login items back.
+
 Not in the backup and so not back: the apps (install them again), Full Disk Access and the other
-permissions in Privacy & Security, what is excluded from Time Machine, caches, and keychain items
+permissions in Privacy & Security, background items apps register themselves (they come back
+when you open the app), what is excluded from Time Machine, caches, and keychain items
 that belong to the old Mac's hardware. iCloud Drive and other cloud storage are left out of the
 restore; they sync again once you sign in. PBS Mackup's next run reads everything.
+
+### Mac Settings (beta)
+
+Your files are the backup. Some of a Mac's settings live outside the home folder, though, and a
+restore of the files doesn't bring them back. **Mac Settings** records them with each backup. It
+is a beta feature, off unless you switch it on under **Beta Features** in the settings; backing up and
+restoring files works the same either way. So far it covers one thing: the apps in your "Open
+at Login" list (System Settings > General > Login Items).
+
+Choose a snapshot in the Backups window and click **Mac Settings…** to see them. An app that's installed is added back with **Add**, or all
+of them with **Add All**; one that isn't says "install first", and becomes addable as soon as
+you install it. After a home restore the app offers this once by itself. Whether an app opened
+hidden isn't recorded: macOS ignores that setting.
+
+Reading and adding login items goes through System Events, which macOS lets the app control
+only once you agree. Allow it under **Record login items** in the Beta Features tab. Without it, backups go on without the list, and the screen says so.
 
 ### Without the Mac
 
@@ -147,6 +166,13 @@ export PBS_REPOSITORY='mac@pbs!backup@pbs.example.net:store'
 proxmox-backup-client snapshot list --ns mac
 proxmox-backup-client restore host/my-mac/2026-11-12T08:00:00Z me.pxar /restore/target \
   --ns mac --keyfile key.json --ignore-xattrs true
+```
+
+With Mac Settings on, the recorded login items of a snapshot are in a small blob of their own:
+
+```sh
+proxmox-backup-client restore host/my-mac/2026-11-12T08:00:00Z settings.conf - \
+  --ns mac --keyfile key.json
 ```
 
 You get contents, names, permissions, dates and links, not the Mac-only metadata.

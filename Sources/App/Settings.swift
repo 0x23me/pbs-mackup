@@ -29,9 +29,15 @@ final class SettingsModel: ObservableObject {
     @Published private(set) var suggestions: [Suggestions.Suggestion] = []
     @Published var expanded: Set<String> = []
     @Published var tab = Tab.backup
-    enum Tab { case backup, server, key }
+    enum Tab { case backup, server, key, beta }
     @Published var status: SetupStatus?
     @Published var fullDiskAccess = FullDiskAccess.granted
+    /// Beta features: the Mac Settings layer, see `Config.macSettings`.
+    @Published var macSettings = false {
+        didSet { if macSettings && loginItems == nil { Task { await checkLoginItems() } } }
+    }
+    /// Whether a run may read the "Open at Login" list; nil until it was checked.
+    @Published var loginItems: LoginItems.Permission?
     @Published var busy = false
     @Published var message = ""
     /// Why the last action on the Encryption Key tab failed; that tab shows it, the others `message`.
@@ -86,6 +92,7 @@ final class SettingsModel: ObservableObject {
         config.excludes = rules
         config.intervalMinutes = intervalMinutes == 60 ? nil : intervalMinutes
         config.fingerprint = confirmedFingerprint
+        config.macSettings = macSettings ? true : nil
         return config
     }
 
@@ -103,6 +110,7 @@ final class SettingsModel: ObservableObject {
             sources = config.sources
             rules = config.excludes
             intervalMinutes = config.interval
+            macSettings = config.macSettingsOn
             // Settings that another program wrote are shown, to be looked at, and count for
             // nothing: not the certificate they vouch for, and not as accepted by the server.
             changedOutside = !Seal.holds(config)
@@ -124,6 +132,8 @@ final class SettingsModel: ObservableObject {
         switch CommandLine.arguments.last {
         case "server": tab = .server
         case "key": tab = .key
+        case "beta": tab = .beta
+        case "beta-on": tab = .beta; macSettings = true; loginItems = .granted
         default: break
         }
         #endif
@@ -132,7 +142,7 @@ final class SettingsModel: ObservableObject {
         if stored != nil, status?.token == true, !changedOutside { accepted = connection }
         if changedOutside {
             tab = .server
-            message = "These settings were changed outside the app. Look through all three tabs, test the connection, then click Done."
+            message = "These settings were changed outside the app. Look through all the tabs, test the connection, then click Done."
         }
         for source in sources {
             if let known = FolderSizes.load(for: source) { measured[source] = known }
@@ -147,6 +157,21 @@ final class SettingsModel: ObservableObject {
         #endif
         status = try? await RunTool.decode(SetupStatus.self, ["setup-status"])
         fullDiskAccess = FullDiskAccess.granted
+        if macSettings { await checkLoginItems() }
+    }
+
+    /// Only while Mac Settings is on: asking launches System Events.
+    func checkLoginItems() async {
+        #if DEBUG
+        if Render.active { return }
+        #endif
+        loginItems = await Task.detached { LoginItems.permission(ask: false) }.value
+    }
+
+    /// Asks the owner, once, to let the app control System Events. The grant also covers the
+    /// run tool, which only ever checks it.
+    func allowLoginItems() async {
+        loginItems = await Task.detached { LoginItems.permission(ask: true) }.value
     }
 
     private func recount() {
@@ -398,6 +423,8 @@ struct SettingsView: View {
                 .tabItem { Text("Server") }.tag(SettingsModel.Tab.server)
             keyTab
                 .tabItem { Text("Encryption Key") }.tag(SettingsModel.Tab.key)
+            betaTab
+                .tabItem { Text("Beta Features") }.tag(SettingsModel.Tab.beta)
         }
         .padding(.top, 10)
         .frame(minWidth: 900, idealWidth: 940, minHeight: 620, idealHeight: 700)
@@ -454,6 +481,43 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var betaTab: some View {
+        Form {
+            Section {
+                Toggle("Mac Settings", isOn: $model.macSettings)
+            } footer: {
+                Text("Features still being tried out. Backing up and restoring your files works the same whether they are on or off.\n\nMac Settings records settings that live outside your home folder with each backup, so a restored or new Mac can get them back. So far that's the apps that open at login: the Backups window shows them under Mac Settings…, and after a home restore the app offers to add them back.")
+                    .multilineTextAlignment(.leading).frame(maxWidth: .infinity, alignment: .leading)
+            }
+            if model.macSettings {
+                Section {
+                    LabeledContent("Record login items", value: loginItemsText)
+                    switch model.loginItems {
+                    case .notAsked?: Button("Allow…") { Task { await model.allowLoginItems() } }
+                    case .denied?: Button("Open Automation Settings") { StatusModel.openAutomation() }
+                    default: EmptyView()
+                    }
+                } header: {
+                    Text("Permission")
+                } footer: {
+                    Text("Login items are read through System Events, which macOS lets PBS Mackup control only once you agree. Without it, backups go on without the list.")
+                        .multilineTextAlignment(.leading).frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var loginItemsText: String {
+        switch model.loginItems {
+        case nil: return "Checking…"
+        case .granted?: return "On"
+        case .notAsked?: return "Not allowed yet"
+        case .denied?: return "Off"
+        case .unknown(let status)?: return "Unknown (error \(status))"
+        }
     }
 
     private var keyTab: some View {

@@ -34,7 +34,7 @@ the place to start.
 | `~/Library/Application Support/pbs-mackup/state.json` | what happened and what is happening, see below |
 | `~/Library/Application Support/pbs-mackup/paused` | an empty file that is there while automatic backups are paused; the app makes and removes it, the run tool only looks for it |
 | `~/Library/Application Support/pbs-mackup/logs/` | one log per run, kept for 30 days |
-| `~/Library/Caches/pbs-mackup/` | the run lock, the backups opened in Finder (`browse`), the files opened from a backup to look at (`preview`, removed when the Backups window closes and when the app quits or starts), the names in the snapshots that were searched (`index`, removed two weeks after the last use), the last measurement of each backed-up folder (`sizes`, folder names and sizes), and during a run the list of changed folders (`changed-folders`) and a marker file for the change log (`changes`) |
+| `~/Library/Caches/pbs-mackup/` | the run lock, the backups opened in Finder (`browse`), the files opened from a backup to look at (`preview`, removed when the Backups window closes and when the app quits or starts), the names in the snapshots that were searched (`index`, removed two weeks after the last use), the last measurement of each backed-up folder (`sizes`, folder names and sizes), and during a run the list of changed folders (`changed-folders`), a marker file for the change log (`changes`) and the settings manifest (`settings.json`, see below) |
 | `~/Library/Group Containers/<Team ID>.<bundle identifier>/` | what no other program is to read or write. macOS asks the owner before it lets a program of another developer into this folder. `mnt` is where a run mounts its APFS snapshot, with its copy of Mail, Messages and the like; `check-…` holds the files a run restores to compare them, `key-…` a new or imported key on its way into the Keychain, both only for a moment. `seal.json` is what the app and the run tool last stored themselves, as two digests: of the configuration and of the encryption key. An app built without a developer's identity has no such folder: it keeps the seal with `config.json` and the rest in the cache, where they are open to every program of the user |
 | login Keychain, service `<bundle identifier>.tool` | the API token secret (`token`) and the encryption key (`encryption-key`). The Keychain hands them to the run tool, which signs under that name. Versions before 0.2 kept them under the bundle identifier itself; 0.2 moves them when the app first starts, and macOS asks for the login password for each |
 
@@ -48,7 +48,8 @@ the place to start.
   "sources": ["/Users/me/Documents"],
   "excludes": ["*.tmp", "node_modules", "/Movies/Raw"],
   "intervalMinutes": 30,
-  "frozenSnapshot": "whenPermitted"
+  "frozenSnapshot": "whenPermitted",
+  "macSettings": true
 }
 ```
 
@@ -117,13 +118,14 @@ pbs-mackup-run index <snapshot> me.pxar
 pbs-mackup-run mount <snapshot> me.pxar
 pbs-mackup-run unmount
 pbs-mackup-run sizes <folder>
+pbs-mackup-run settings <snapshot>
 ```
 
 Started this way, and not by the app, the tool asks for Touch ID or the login password before
 it does any of these but `unmount` and `sizes`: any program of yours can start it, and it is
 the one the Keychain hands the token and the key to.
 
-`index` writes the names in a snapshot to a JSON file in the cache, `mount` needs FUSE-T and
+`settings` prints the settings manifest of a snapshot (see below). `index` writes the names in a snapshot to a JSON file in the cache, `mount` needs FUSE-T and
 prints the folder; it refuses when `/usr/local/lib/libfuse3.4.dylib`, `/usr/local/bin/go-nfsv4`
 or a folder on the way to them does not belong to root or can be written by others. `unmount`
 takes everything mounted this way. A snapshot is named
@@ -146,6 +148,39 @@ that a version before 0.2 stored; the app asks for it when it starts. `serve` is
 it answers the app until launchd stops it. `certificate <host> <port>` prints the server
 certificate's fingerprint and whether the client takes it without one, judged by the roots in
 `/etc/ssl/cert.pem`. Called with a command it doesn't know, the tool lists all of them.
+
+## The settings manifest
+
+While Mac Settings is switched on (a beta feature; `"macSettings": true` in `config.json`, absent when
+off), each run records the settings that live outside the backed-up folders and uploads them with the
+backup as `settings.conf` (on the server `settings.conf.blob`), encrypted with the same key.
+It doesn't count as an archive: the Backups window, search and `restore-home` don't show it.
+Snapshots from before this was added don't have one. Fetched by itself:
+
+```sh
+proxmox-backup-client restore host/my-mac/2026-11-12T08:00:00Z settings.conf - --ns mac --keyfile key.json
+```
+
+```json
+{
+  "format": 1,
+  "taken": "2026-11-16T09:00:00Z",
+  "macOS": "27.2",
+  "loginItems": {
+    "status": "ok",
+    "items": [ { "name": "Raycast", "bundleID": "com.raycast.macos", "path": "/Applications/Raycast.app" } ]
+  }
+}
+```
+
+Each kind of setting is a section with `status` (`ok` or `unavailable`), a `reason` when it is
+unavailable, and `items`. A reader ignores sections it doesn't know; `format` changes only when
+a section changes incompatibly. Login items are the only section so far. They're read from
+System Events, with the Automation permission the app asks for under **Record login items** in the Beta Features tab. A
+run only checks that permission and never asks for it. Without it, or when System Events takes
+more than 5 seconds, the section is `unavailable` with the reason, and the backup goes on.
+`bundleID` comes from the app at `path` and is missing where that has none. On a restored Mac,
+the app finds an app by its bundle identifier first and by its path second.
 
 ## Restoring a whole home folder
 
