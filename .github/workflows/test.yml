@@ -20,10 +20,23 @@ jobs:
   test:
     # The same image as the release, so the tests run on the macOS version the app asks for.
     runs-on: macos-26
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - run: swift build
-      - run: swift test
+      # The tests take seconds. A step that is still running after 8 minutes is stuck, and the
+      # step after it says where (a stuck run is otherwise only cut off at the end of the job).
+      - run: swift test 2>&1 | tee test.log
+        shell: bash
+        timeout-minutes: 8
+      - name: Show where a stuck test waits
+        if: failure() || cancelled()
+        shell: bash
+        run: |
+          echo "--- last tests started"; grep -E "started\.|passed|failed" test.log | tail -15 || true
+          echo "--- processes"; ps -axo pid,ppid,etime,stat,command | grep -Ev "ps -axo|grep" | tail -40
+          for pid in $(pgrep -f "swiftpm-testing-helper|xctest|proxmox-backup-client|pbs-mackup-run" || true); do
+            echo "--- sample $pid"; sample "$pid" 2 -file /dev/stdout 2>&1 | head -60 || true
+          done
