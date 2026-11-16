@@ -111,6 +111,34 @@ is refused when FUSE-T's files in `/usr/local` or a folder above them can be cha
 but root, as on an Intel Mac where Homebrew owns `/usr/local/lib`: what is loaded from there
 runs with the token and the key.
 
+### After losing the Mac
+
+The whole home folder comes back on a freshly installed Mac, and you log in to it as before:
+files, settings, the login keychain, and PBS Mackup with its settings and key. It can't be put
+back while you are logged in, so a second administrator does it.
+
+1. Install macOS. In Setup Assistant, make your account with the same short name as before
+   (`me`) and your old password, which the old login keychain opens with.
+2. In System Settings, add an administrator `setup`, log out (not just switch users) and log in
+   as `setup`. Install PBS Mackup, give Terminal Full Disk Access, and have the recovery copy of
+   the key at hand.
+3. Restore, which asks for the token secret and, when the key file has one, its passphrase:
+
+   ```sh
+   sudo /Applications/PBSMackup.app/Contents/MacOS/pbs-mackup-run restore-home me \
+     'mac@pbs!backup@pbs.example.net:store' key.json --ns mac
+   ```
+
+   It takes the newest snapshot that has `me.pxar`, restores it next to the new home folder,
+   and swaps the two once it is complete; the new one is kept as `/Users/me.before-restore`.
+4. Restart and log in as `me`. Once everything is there, delete `setup` and
+   `/Users/me.before-restore`.
+
+Not in the backup and so not back: the apps (install them again), Full Disk Access and the other
+permissions in Privacy & Security (PBS Mackup needs its Full Disk Access again), what is excluded
+from Time Machine, caches, and keychain items that belong to the old Mac's hardware. PBS Mackup's
+next run reads everything. This has not been tried with iCloud Drive signed in yet.
+
 ### Without the Mac
 
 On Linux, with the official `proxmox-backup-client` 4.x and the recovery copy of the key:

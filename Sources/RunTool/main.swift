@@ -245,6 +245,10 @@ let commands: [Command] = [
                 return try json(SetupStatus(configured: (try? Config.load()) != nil, token: try Keychain.get(.token) != nil,
                                             key: try KeyStore.status()))
             }),
+    // Root runs it with sudo, which has the administrator's password already; nothing more is asked.
+    Command(name: "restore-home", arguments: restoreHomeArguments,
+            what: "with sudo, from another administrator: a user's whole home folder back from a backup, on a new Mac",
+            run: .plain { call in try restoreHome(call) }),
     Command(name: "certificate", arguments: "<host> <port>", count: 2...2,
             what: "the server certificate's fingerprint and whether the client takes it without one",
             run: .plain { call in

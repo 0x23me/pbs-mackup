@@ -11,6 +11,8 @@ public struct Client {
     public let config: Config
     private let token: Data
     private let key: Data
+    /// The passphrase of a key that is locked with one; only `restore-home` is given such a key.
+    private let keyPassphrase: Data?
 
     /// `needsKey: false` is for the connection check during setup, before a key exists.
     public init(config: Config, needsKey: Bool = true) throws {
@@ -32,6 +34,18 @@ public struct Client {
         self.config = config
         self.token = token
         self.key = key
+        self.keyPassphrase = nil
+    }
+
+    /// For `restore-home`, on a Mac where nothing is set up yet and that is run by root: the
+    /// token and the key as the owner hands them over, not from the Keychain, and so with no
+    /// seal to hold the key against. `keyPassphrase` is for a key file locked with one; the
+    /// client gets it on a descriptor of its own (`PBS_ENCRYPTION_PASSWORD_FD`).
+    public init(config: Config, token: Data, key: Data, keyPassphrase: Data? = nil) {
+        self.config = config
+        self.token = token
+        self.key = key
+        self.keyPassphrase = keyPassphrase
     }
 
     public var executable: URL { Client.executable(clientPath: config.clientPath) }
@@ -155,6 +169,10 @@ public struct Client {
         var input: [Int32: Data] = [3: Data(secret.utf8)]
         // A command that takes no key gets none: its standard input is empty.
         if usesKey { input[0] = key }
+        if usesKey, let keyPassphrase {
+            environment["PBS_ENCRYPTION_PASSWORD_FD"] = "4"
+            input[4] = Data((String(decoding: keyPassphrase, as: UTF8.self).trimmingCharacters(in: .newlines) + "\n").utf8)
+        }
         let child = try Child(executable, arguments + ["--ns", config.namespace] + (usesKey ? ["--keyfd", "0"] : []),
                               environment: environment, input: input, mergingErrors: mergingErrors, sendingInput: false)
         if let requirement {
@@ -284,7 +302,11 @@ public struct Client {
 
     /// The snapshots of this Mac's backup group, newest first. What the server lists under a
     /// name that is not a snapshot's or an archive's is left out.
-    public func snapshots() throws -> [Snapshot] {
+    public func snapshots() throws -> [Snapshot] { try snapshots(group: "host/\(config.backupID)") }
+
+    /// The snapshots of one group, `host/<id>`, or with nil of every group in the namespace;
+    /// newest first.
+    public func snapshots(group: String?) throws -> [Snapshot] {
         struct Raw: Decodable {
             struct File: Decodable { let filename: String }
             let backupType: String, backupID: String, backupTime: Int64
@@ -294,7 +316,7 @@ public struct Client {
                 case backupType = "backup-type", backupID = "backup-id", backupTime = "backup-time", files, size
             }
         }
-        let data = try capture(["snapshot", "list", "host/\(config.backupID)", "--output-format", "json"], usesKey: false)
+        let data = try capture(["snapshot", "list"] + (group.map { [$0] } ?? []) + ["--output-format", "json"], usesKey: false)
         let formatter = ISO8601DateFormatter()
         return try JSONDecoder().decode([Raw].self, from: data).compactMap { raw -> Snapshot? in
             let time = Date(timeIntervalSince1970: TimeInterval(raw.backupTime))

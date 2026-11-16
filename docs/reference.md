@@ -147,6 +147,37 @@ it answers the app until launchd stops it. `certificate <host> <port>` prints th
 certificate's fingerprint and whether the client takes it without one, judged by the roots in
 `/etc/ssl/cert.pem`. Called with a command it doesn't know, the tool lists all of them.
 
+## Restoring a whole home folder
+
+```sh
+sudo pbs-mackup-run restore-home <user> <repository> <key file> [--ns <namespace>]
+    [--from <backup id> | --snapshot <snapshot>] [--archive <folder>.pxar] [--fingerprint <fingerprint>] [--yes]
+```
+
+For a Mac that was set up anew; the steps around it are in the README ("After losing the Mac").
+It runs as root and only from a terminal, never for the app, and takes nothing from a Keychain:
+the token secret is asked for (or read from standard input when that is not a terminal), the
+key comes from the recovery file, and a key file locked with a passphrase asks for it. The
+client gets all three on descriptors, as in a backup.
+
+It refuses when the user does not exist, has programs running (logged in, also when the Mac only
+switched to another user) or is the one who started `sudo`, when `<home>.restored` or
+`<home>.before-restore` is already there, and when the disk has less room than the snapshot
+takes. The archive is the one named after the user's home folder (`me.pxar`), and the snapshot
+the newest that has it, of the one backup group that has it; with two such groups `--from` says
+which. Then, after a question that `--yes` answers:
+
+1. The archive is restored as `<home>.restored`, with owners, permissions, ACLs, flags and the
+   Mac metadata. A restore that fails leaves nothing behind.
+2. When the restored folder belongs to another uid than the user has on this Mac, everything of
+   that uid becomes the user's.
+3. macOS names a user in an ACL by a GeneratedUID, which a new account gets anew. When the ACLs
+   name exactly one id this Mac does not know, that is the owner as the old Mac knew them, and
+   it is replaced with the user's id here. By default only `Public/Drop Box` has such an ACL.
+4. The home folder becomes `<home>.before-restore` and the restored one takes its place. When
+   the second step fails the first is undone. Moving a home folder needs Full Disk Access for
+   the terminal.
+
 ## When a run reads everything
 
 A run notes where the macOS change log (FSEvents) stands before it takes its snapshot. The
