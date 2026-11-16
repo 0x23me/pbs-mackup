@@ -1,6 +1,13 @@
 import Darwin
 import Foundation
 
+// <membership.h>, declared here because not every SDK has `Darwin` show it (the one on the macos-26
+// runner does not); the system library has them all the same.
+@_silgen_name("mbr_uid_to_uuid")
+private func membershipUUID(ofUID uid: uid_t, _ uuid: UnsafeMutablePointer<UInt8>) -> Int32
+@_silgen_name("mbr_uuid_to_id")
+private func membershipID(ofUUID uuid: UnsafePointer<UInt8>, _ id: UnsafeMutablePointer<id_t>, _ kind: UnsafeMutablePointer<Int32>) -> Int32
+
 /// Puts a whole home folder back on a Mac that was set up anew: what `pbs-mackup-run
 /// restore-home` does. Root does it, from the account of another administrator, while the
 /// user whose folder it is is not logged in. The folder is restored next to the user's new
@@ -143,7 +150,7 @@ public enum HomeRestore {
     /// The GeneratedUID of a user of this Mac.
     public static func generatedUID(of uid: uid_t) -> UUID? {
         var id = UUID().uuid
-        let status = withUnsafeMutableBytes(of: &id) { mbr_uid_to_uuid(uid, $0.baseAddress!.assumingMemoryBound(to: UInt8.self)) }
+        let status = withUnsafeMutableBytes(of: &id) { membershipUUID(ofUID: uid, $0.baseAddress!.assumingMemoryBound(to: UInt8.self)) }
         return status == 0 ? UUID(uuid: id) : nil
     }
 
@@ -284,6 +291,6 @@ public enum HomeRestore {
     /// Whether this Mac knows the user or group `id` stands for.
     static func isKnown(_ id: UUID) -> Bool {
         var uuid = id.uuid, found = id_t(), kind: Int32 = 0
-        return withUnsafeBytes(of: &uuid) { mbr_uuid_to_id($0.baseAddress!.assumingMemoryBound(to: UInt8.self), &found, &kind) } == 0
+        return withUnsafeBytes(of: &uuid) { membershipID(ofUUID: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), &found, &kind) } == 0
     }
 }
