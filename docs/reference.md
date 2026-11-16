@@ -305,7 +305,12 @@ needs it and unregisters at Finish; macOS asks the owner to allow it under Login
 
 A run notes where the macOS change log (FSEvents) stands before it takes its snapshot. The
 next run reads the folders changed since and takes the others over from the previous backup.
-A folder that was moved or renamed is read with everything below it. Everything is read when:
+A folder that was moved or renamed is read with everything below it. macOS logs a change to a
+file's contents only once the program that wrote it closes it, so a run also reads the folders
+of the files that the owner's programs have open for writing, or mapped to write to, after it
+took its snapshot (a database that a background process keeps open, for one). What programs of
+other users or of the system keep open is not known; it is in the log once they close it.
+Everything is read when:
 
 - there is no earlier backup to build on, or the newest one on the server isn't the one the
   last run made;

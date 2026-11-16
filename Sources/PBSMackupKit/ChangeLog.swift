@@ -51,7 +51,15 @@ public enum ChangeLog {
     /// What changed at or below `roots` since `since`. `marker` is a folder on the same volume
     /// that nothing else writes to: a file is made there and the answer is complete once the
     /// log reports it, because the log reports in the order things happened.
-    public static func changes(below roots: [String], since: Position, marker: URL, timeout: TimeInterval = 120) -> Answer {
+    ///
+    /// The log has no word of a file that a program writes to and keeps open: macOS logs a
+    /// change to a file's contents when the program that wrote it closes it, or ends, and not
+    /// before; writes through a mapping of the file are not logged either. So the folders of
+    /// the files open for writing now (`writing`) are read as well. A run asks after it took
+    /// its snapshot: a file written before the snapshot is then either still open, or closed
+    /// and in the log before the marker.
+    public static func changes(below roots: [String], since: Position, marker: URL, timeout: TimeInterval = 120,
+                               writing: () -> Set<String> = filesOpenForWriting) -> Answer {
         guard let first = roots.first, let now = position(of: first) else { return .unusable("this volume keeps no change log") }
         guard now.log == since.log else { return .unusable("macOS started its change log over") }
         guard since.event <= now.event else { return .unusable("the remembered position is ahead of the change log") }
@@ -98,6 +106,8 @@ public enum ChangeLog {
             return true
         }
         guard wait(until: { collector.historyDone || collector.failure != nil }) else { return .unusable("the change log did not answer in time") }
+        let open = writing()
+        queue.sync { for path in open { collector.takeOpen(path) } }
         // What happened a moment ago may not be reported yet. A change of our own, made now,
         // marks the end: everything before it has been reported once it is.
         let file = marker.appendingPathComponent(UUID().uuidString)
@@ -160,5 +170,62 @@ public enum ChangeLog {
                 changes.folders.insert(path)
             }
         }
+
+        /// A file open for writing: its folder is read.
+        func takeOpen(_ reported: String) {
+            // The Data volume's own name for a path in the home folder.
+            let data = "/System/Volumes/Data"
+            let path = reported.hasPrefix(data + "/") ? String(reported.dropFirst(data.count)) : reported
+            guard !roots.contains(path), roots.contains(where: { path.hasPrefix($0 + "/") }) else { return }
+            changes.folders.insert((path as NSString).deletingLastPathComponent)
+        }
+    }
+
+    /// The files that the user's programs have open for writing now, or mapped so that they
+    /// can write to them, as the paths macOS gives for them. The programs of other users and
+    /// of the system cannot be asked: what they write is in the log once they close it.
+    public static func filesOpenForWriting() -> Set<String> {
+        var found = Set<String>()
+        let count = proc_listallpids(nil, 0)
+        guard count > 0 else { return found }
+        var pids = [pid_t](repeating: 0, count: Int(count) + 64)
+        let listed = proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.stride))
+        for pid in pids.prefix(Int(max(listed, 0))) where pid > 0 {
+            // Descriptors opened for writing.
+            let size = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+            guard size > 0 else { continue }
+            var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: Int(size) / MemoryLayout<proc_fdinfo>.stride + 16)
+            let got = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, &fds, Int32(fds.count * MemoryLayout<proc_fdinfo>.stride))
+            guard got > 0 else { continue }
+            for fd in fds.prefix(Int(got) / MemoryLayout<proc_fdinfo>.stride) where fd.proc_fdtype == PROX_FDTYPE_VNODE {
+                var info = vnode_fdinfowithpath()
+                let size = Int32(MemoryLayout<vnode_fdinfowithpath>.size)
+                guard proc_pidfdinfo(pid, fd.proc_fd, PROC_PIDFDVNODEPATHINFO, &info, size) == size,
+                      info.pfi.fi_openflags & UInt32(FWRITE) != 0 else { continue }
+                let path = cString(info.pvip.vip_path)
+                if !path.isEmpty { found.insert(path) }
+            }
+            // Files mapped into memory where writing is allowed, which stay so after their
+            // descriptor is closed. Private mappings are counted too: telling them apart is not
+            // worth the risk, and reading a folder too many costs little.
+            var address: UInt64 = 0
+            while true {
+                var region = proc_regionwithpathinfo()
+                let size = Int32(MemoryLayout<proc_regionwithpathinfo>.size)
+                guard proc_pidinfo(pid, PROC_PIDREGIONPATHINFO, address, &region, size) == size else { break }
+                let range = region.prp_prinfo
+                if range.pri_max_protection & UInt32(VM_PROT_WRITE) != 0 {
+                    let path = cString(region.prp_vip.vip_path)
+                    if !path.isEmpty { found.insert(path) }
+                }
+                guard range.pri_size > 0 else { break }
+                address = range.pri_address + range.pri_size
+            }
+        }
+        return found
+    }
+
+    private static func cString<T>(_ tuple: T) -> String {
+        withUnsafeBytes(of: tuple) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
     }
 }

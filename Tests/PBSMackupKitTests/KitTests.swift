@@ -386,6 +386,49 @@ private func record(_ outcome: Outcome, at start: Date, reason: String? = nil) -
             == .unusable("the remembered position is ahead of the change log"))
 }
 
+@Test func aFileWrittenWhileItStaysOpenHasItsFolderRead() throws {
+    // A database's write-ahead log, which a daemon keeps open and writes to: macOS logs the
+    // change only when it is closed. The snapshot catches it in between.
+    let root = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Caches/pbs-mackup-test-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    for folder in ["data/db", "data/mapped", "data/quiet", "marker"] {
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(folder), withIntermediateDirectories: true)
+    }
+    let wal = root.appendingPathComponent("data/db/views.db-wal").path
+    let shm = root.appendingPathComponent("data/mapped/views.db-shm").path
+    try Data(count: 16384).write(to: URL(fileURLWithPath: wal))
+    try Data(count: 16384).write(to: URL(fileURLWithPath: shm))
+    try Data("one".utf8).write(to: root.appendingPathComponent("data/quiet/file.txt"))
+    let data = Config.realPath(root.appendingPathComponent("data").path)
+    let marker = root.appendingPathComponent("marker")
+
+    let fd = open(wal, O_RDWR)
+    try #require(fd >= 0)
+    defer { close(fd) }
+    let mapping = open(shm, O_RDWR)
+    try #require(mapping >= 0)
+    let memory = try #require(mmap(nil, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, mapping, 0))
+    close(mapping)  // the mapping stays, with no descriptor to show for it
+    defer { munmap(memory, 16384) }
+    usleep(1_500_000)
+    let start = try #require(ChangeLog.position(of: data))
+
+    var bytes = [UInt8](repeating: 7, count: 100)
+    #expect(pwrite(fd, &bytes, 100, 4096) == 100)
+    fsync(fd)
+    memory.storeBytes(of: UInt64(42), toByteOffset: 64, as: UInt64.self)
+    msync(memory, 16384, MS_SYNC)
+
+    // The log alone has nothing: this is the gap.
+    #expect(ChangeLog.changes(below: [data], since: start, marker: marker, writing: { [] }) == .changes(.init()))
+    // Asked which files are open for writing, both folders are read, and only those.
+    guard case .changes(let changes) = ChangeLog.changes(below: [data], since: start, marker: marker) else {
+        Issue.record("the change log gave no answer"); return
+    }
+    #expect(changes.folders == [data + "/db", data + "/mapped"])
+    #expect(changes.subtrees.isEmpty)
+}
+
 @Test func aScheduledRunWaitsForTheInterval() {
     let last = Date(timeIntervalSince1970: 1_800_000_000)
     var state = State()
