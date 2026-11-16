@@ -212,10 +212,16 @@ public final class Child {
     /// it arrives, a piece at a time, instead of being kept: for a program that writes a lot.
     public func finish(output take: (Data) -> Void) -> (status: Int32, errors: Data) {
         var complaints = Data()
-        let group = DispatchGroup()
-        if let errors { DispatchQueue.global().async(group: group) { complaints = errors.readDataToEndOfFile() } }
+        // A thread of its own, not a block for a dispatch queue: this one waits in `read` for as long as
+        // the program lives, and when the queues' threads are all taken by callers that wait too (the
+        // tests of a machine with few cores) the block is never started and `finish` never returns.
+        let done = DispatchSemaphore(value: 0)
+        if let errors {
+            let reader = Thread { complaints = errors.readDataToEndOfFile(); done.signal() }
+            reader.start()
+        } else { done.signal() }
         while case let piece = output.availableData, !piece.isEmpty { take(piece) }
-        group.wait()
+        done.wait()
         return (wait(), complaints)
     }
 }
