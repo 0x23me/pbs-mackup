@@ -100,6 +100,90 @@ public enum SampleCheck {
         return false
     }
 
+    /// Restores a picked file into `target`, where it appears under its own name. `extract`
+    /// restores one path of the archive into a folder, as `catalog extract` does.
+    ///
+    /// A file with more than one name is stored once, under the name the backup came to first;
+    /// each later name is stored as a link to that path, which the client can only make once
+    /// that name is restored into the same folder as well. So when such a file cannot be
+    /// restored on its own, its other names in the folder the link points into are restored
+    /// first, each where it lies in the archive, and then the file once more. What is compared
+    /// afterwards is the content stored under the first name, which is this file's content too.
+    static func restore(_ relative: String, in folder: URL, into target: URL,
+                        extract: (_ path: String, _ into: URL) throws -> Void) throws {
+        do {
+            try extract(relative, target)
+        } catch let failure {
+            var file = stat()
+            guard !Client.isMissingPath(failure), lstat(folder.appendingPathComponent(relative).path, &file) == 0,
+                  file.st_mode & S_IFMT == S_IFREG, file.st_nlink > 1 else { throw failure }
+            // The client names the folder of the first name when it cannot open it; a first name
+            // at the top of the archive has no folder to name.
+            let linked = hardLinkFolder(in: "\(failure)") ?? ""
+            let place = linked.isEmpty ? folder : folder.appendingPathComponent(linked)
+            let names = ((try? FileManager.default.contentsOfDirectory(atPath: place.path)) ?? [])
+                .sorted { Array($0.utf8).lexicographicallyPrecedes(Array($1.utf8)) }
+            for name in names {
+                let path = linked.isEmpty ? name : linked + "/" + name
+                var info = stat()
+                guard path != relative, lstat(place.appendingPathComponent(name).path, &info) == 0,
+                      info.st_dev == file.st_dev, info.st_ino == file.st_ino else { continue }
+                do {
+                    let into = linked.isEmpty ? target : target.appendingPathComponent(linked)
+                    try FileManager.default.createDirectory(at: into, withIntermediateDirectories: true)
+                    try extract(path, into)
+                    try extract(relative, target)
+                    return
+                } catch {
+                    continue        // not the name the link points to, or not restorable either
+                }
+            }
+            throw failure
+        }
+    }
+
+    /// The folder a hard link points into, from the client's words when it cannot open it:
+    /// `failed to open hardlink target directory "<folder>"`, the folder written as Rust writes
+    /// a path, with `\"`, `\\`, `\'`, `\n`, `\u{308}`, `\xff` and the like. Nil when the words
+    /// are not there.
+    static func hardLinkFolder(in message: String) -> String? {
+        guard let start = message.range(of: "failed to open hardlink target directory \"") else { return nil }
+        var scalars = message[start.upperBound...].unicodeScalars.makeIterator()
+        var bytes: [UInt8] = []
+        func hex(until end: Unicode.Scalar?, count: Int?) -> UInt32? {
+            var digits = ""
+            while count.map({ digits.count < $0 }) ?? true, let scalar = scalars.next(), scalar != end { digits.unicodeScalars.append(scalar) }
+            return UInt32(digits, radix: 16)
+        }
+        while let scalar = scalars.next() {
+            switch scalar {
+            case "\"":
+                return String(decoding: bytes, as: UTF8.self)
+            case "\\":
+                switch scalars.next() {
+                case "t": bytes.append(9)
+                case "n": bytes.append(10)
+                case "r": bytes.append(13)
+                case "0": bytes.append(0)
+                case "x":
+                    guard let byte = hex(until: nil, count: 2), byte <= 0xFF else { return nil }
+                    bytes.append(UInt8(byte))
+                case "u":
+                    guard scalars.next() == "{", let value = hex(until: "}", count: nil),
+                          let decoded = Unicode.Scalar(value) else { return nil }
+                    bytes += Array(String(decoded).utf8)
+                case let other?:
+                    bytes += Array(String(other).utf8)
+                case nil:
+                    return nil
+                }
+            default:
+                bytes += Array(String(scalar).utf8)
+            }
+        }
+        return nil
+    }
+
     /// What differs between a file and its restored copy, in words; empty when nothing does.
     public static func differences(original: URL, restored: URL) -> [String] {
         guard let a = Fingerprint(original), let b = Fingerprint(restored) else { return ["cannot be read"] }

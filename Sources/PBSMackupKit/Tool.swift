@@ -39,26 +39,23 @@ func exists(_ url: URL) -> Bool {
 /// ACL that forbids it (as on ~/Downloads), or a folder its owner may not write to. All three
 /// are taken off first, by this program itself and not by `chflags` and `chmod`: such a folder
 /// can lie where macOS lets other programs in only after asking (`Paths.guarded`).
-func removeRestored(_ folder: URL) {
-    func unlock(_ item: URL) {
-        var info = stat()
-        guard lstat(item.path, &info) == 0 else { return }
-        // The lock first: a locked item does not let go of its ACL either.
-        let locks = UInt32(UF_IMMUTABLE | UF_APPEND)
-        if info.st_flags & locks != 0 { lchflags(item.path, info.st_flags & ~locks) }
-        if let none = acl_init(0) {
-            acl_set_link_np(item.path, ACL_TYPE_EXTENDED, none)
-            acl_free(UnsafeMutableRawPointer(none))
-        }
-        guard info.st_mode & S_IFMT == S_IFDIR else { return }
-        chmod(item.path, (info.st_mode & 0o7777) | 0o700)
-        for name in (try? FileManager.default.contentsOfDirectory(atPath: item.path)) ?? [] {
-            unlock(item.appendingPathComponent(name))
-        }
+///
+/// Nothing below `folder` is reached by a path, see `Tree`: a link in it is removed and never
+/// followed, whoever puts one there meanwhile, and `folder` itself is only removed, not
+/// followed, when it is a link. Still, root uses this only where nobody else can put anything
+/// (`HomeRestore.Places.staging`): a lock comes off whatever lies in the folder, and that can
+/// be a second name of a file that is someone else's. Returns what could not be removed.
+@discardableResult
+func removeRestored(_ folder: URL) -> Leftovers {
+    var left = Leftovers()
+    guard exists(folder) else { return left }
+    guard let (parent, name) = Tree.parent(of: folder) else {
+        left.add(folder.path)
+        return left
     }
-    guard exists(folder) else { return }
-    unlock(folder)
-    try? FileManager.default.removeItem(at: folder)
+    defer { close(parent) }
+    Tree.remove(name, in: parent, at: folder.path, left: &left)
+    return left
 }
 
 extension Sequence where Element == UInt8 {

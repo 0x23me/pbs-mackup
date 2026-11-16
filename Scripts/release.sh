@@ -7,6 +7,8 @@
 # "pbs-mackup"), stored once with:
 #   xcrun notarytool store-credentials pbs-mackup --apple-id ... --team-id ...
 # PBS_MACKUP_REPOSITORY is the GitHub repository the zip will be attached to as release vVERSION.
+# PBS_MACKUP_RUN_TOOL_PROFILE has to name the run tool's provisioning profile (see bundle.sh): a
+# release keeps the token and the key in the data protection keychain, and is not made without.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version="${1:?usage: release.sh VERSION, as 0.1.0}"
@@ -17,6 +19,8 @@ else
     notary=(--keychain-profile "${PBS_MACKUP_NOTARY_PROFILE:-pbs-mackup}")
 fi
 repository="${PBS_MACKUP_REPOSITORY:-0x23me/pbs-mackup}"
+[ -n "${PBS_MACKUP_RUN_TOOL_PROFILE:-}" ] || {
+    echo "a release needs the run tool's provisioning profile: name it in PBS_MACKUP_RUN_TOOL_PROFILE" >&2; exit 1; }
 PBS_MACKUP_VERSION="$version" ./Scripts/bundle.sh
 app=.build/PBSMackup.app
 id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")"
@@ -50,14 +54,35 @@ cask "pbs-mackup" do
 
   app "PBSMackup.app"
 
-  uninstall launchctl: ["$id.scheduled", "$id.manual", "$id.helper", "$id.run"],
+  uninstall launchctl: [
+              "$id.helper",
+              "$id.manual",
+              "$id.restore",
+              "$id.scheduled",
+            ],
             quit:      "$id"
 
-  zap trash: [
-    "~/Library/Application Support/pbs-mackup",
-    "~/Library/Caches/pbs-mackup",
-    "~/Library/Group Containers/$team.$id",
-  ]
+  # The restore daemon removes its right, its state and the folder it restores in when a
+  # restore is finished; script and delete are for an app that is removed in the middle of
+  # one. The folder in /Users holds only what came from a backup. A home folder that a
+  # restore set aside (<home>.before-restore) is its owner's files and stays, and so does
+  # the Keychain, where the encryption key is.
+  zap script: {
+        executable:   "/usr/bin/security",
+        args:         ["authorizationdb", "remove", "$id.restore-home"],
+        must_succeed: false,
+        sudo:         true,
+      },
+      delete: [
+        "/Library/Application Support/$id",
+        "/Users/.pbs-mackup-restore-*",
+      ],
+      trash:  [
+        "~/Library/Application Support/pbs-mackup",
+        "~/Library/Caches/pbs-mackup",
+        "~/Library/Group Containers/$team.$id",
+        "~/Library/Preferences/$id.plist",
+      ]
 
   caveats <<~EOS
     Switch on Full Disk Access for PBS Mackup in System Settings.

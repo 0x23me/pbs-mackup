@@ -52,14 +52,9 @@ public final class Runner {
         defer { close(lockFD) }
 
         state = State.load()
-        // A pause from before it had a file of its own moves there.
-        if state.paused, (try? Pause.set(true)) != nil {
-            state.paused = false
-            save()
-        }
         stopOrphanedClient()
         removeLeftovers()
-        if (Pause.isOn || state.paused) && trigger == .scheduled {
+        if Pause.isOn && trigger == .scheduled {
             print("automatic backups are paused")
             return .done
         }
@@ -187,10 +182,12 @@ public final class Runner {
         let count = config.sampleFiles ?? 20
         guard let snapshot, count > 0, !config.sources.isEmpty else { return (0, []) }
         // The restored files are readable copies of what the backup keeps encrypted, and they
-        // can be anything in the home folder: they go where other programs are kept out.
-        let staging = Paths.guarded.appendingPathComponent("check-\(UUID().uuidString)")
-        try? FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
-        defer { removeRestored(staging) }
+        // can be anything in the home folder: they go where other programs are kept out, into
+        // a folder that is removed later should this run not get to it (`Scratch`).
+        let scratch: Scratch
+        do { scratch = try Scratch(.check) } catch { return (0, ["nothing could be restored: \(error)"]) }
+        let staging = scratch.folder
+        defer { scratch.remove() }
         var checked = 0
         var mismatches: [String] = []
         let share = max(1, count / config.sources.count)
@@ -208,7 +205,9 @@ public final class Runner {
                    modified >= start { continue }
                 let target = staging.appendingPathComponent("\(checked)")
                 do {
-                    _ = try client.capture(["catalog", "extract", snapshot, Config.archiveName(for: path), Client.pathArgument(relative), target.path])
+                    try SampleCheck.restore(relative, in: folder, into: target) { item, into in
+                        _ = try client.capture(["catalog", "extract", snapshot, Config.archiveName(for: path), Client.pathArgument(item), into.path])
+                    }
                 } catch {
                     // A picked file is only rightly absent from the snapshot where the picker
                     // could not tell; anywhere else the backup has lost it.
@@ -270,6 +269,7 @@ public final class Runner {
             return (nil, "everything read: \(reason)")
         case .changes(let found):
             do {
+                try FileManager.default.createDirectory(at: Paths.guarded, withIntermediateDirectories: true)
                 try found.records(prefix: root).write(to: Paths.changedFolders, options: .atomic)
                 try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Paths.changedFolders.path)
             } catch {
@@ -305,6 +305,7 @@ public final class Runner {
         let manifest = SettingsManifest.capture()
         log("login items: " + (manifest.loginItems.reason ?? "\(manifest.loginItems.items.count) recorded"))
         do {
+            try FileManager.default.createDirectory(at: Paths.guarded, withIntermediateDirectories: true)
             try manifest.encoded().write(to: Paths.settingsManifest, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Paths.settingsManifest.path)
             return Paths.settingsManifest
@@ -396,11 +397,13 @@ public final class Runner {
         save()
     }
 
-    /// Unmounts and deletes the snapshot this or an interrupted earlier run created.
+    /// Unmounts and deletes the snapshot this or an interrupted earlier run created, and
+    /// removes the folders that a command left which was stopped before it removed its own.
     private func removeLeftovers() {
+        Scratch.removeLeftovers()
         LocalSnapshot.unmount(Paths.mount)
-        // An earlier version mounted in the cache; a run of it that was stopped left its snapshot there.
-        LocalSnapshot.unmount(Paths.cache.appendingPathComponent("mnt"))
+        // Versions up to 0.5.0 kept names of the owner's files in the cache, which have their place with the mount now.
+        Paths.removeNamesFromCache()
         if let date = state.localSnapshot {
             LocalSnapshot.delete(date)
             state.localSnapshot = nil

@@ -57,8 +57,7 @@ public struct Client {
     public static func executable(clientPath: String?) -> URL {
         // Not argv[0]: launchd starts the tool with a path relative to the bundle.
         let tool = Bundle.main.executableURL?.resolvingSymlinksInPath() ?? URL(fileURLWithPath: ".")
-        let bundled = tool.deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("Helpers/proxmox-backup-client")
+        let bundled = Client.bundled(for: tool)
         #if DEBUG
         if let path = clientPath { return URL(fileURLWithPath: (path as NSString).expandingTildeInPath) }
         if FileManager.default.isExecutableFile(atPath: bundled.path) { return bundled }
@@ -72,12 +71,39 @@ public struct Client {
         #endif
     }
 
+    /// Where the client is for the run tool in `tool`: in `Contents/Helpers` of the app the
+    /// tool is part of, whether the tool is in the app's `Contents/MacOS` or in a bundle of
+    /// its own inside the app.
+    static func bundled(for tool: URL) -> URL {
+        (Identity.app(of: tool)?.appendingPathComponent("Contents") ?? tool.deletingLastPathComponent().deletingLastPathComponent())
+            .appendingPathComponent("Helpers/proxmox-backup-client")
+    }
+
     /// What every client starts with, built from scratch: no variable the tool inherited is
     /// handed on to the client, where it could name another server or a proxy, other trusted
-    /// roots, or a command to run. The home folder, the user and the temporary folder are the
-    /// ones the app itself uses; with `PBS_MACKUP_HOME` the client keeps its files there too.
+    /// roots, or a command to run. The user and the temporary folder are the ones the app
+    /// itself uses.
+    ///
+    /// The home folder is not the owner's but one of the client's own (`Paths.clientHome`).
+    /// The client takes what lies in `.config/proxmox-backup` of its home for the owner's
+    /// wishes, and every program of the owner can write to the owner's home. With a
+    /// `master-public.pem` there, each backup uploads its encryption key, encrypted for
+    /// whoever has the other half of that file. With a line in `fingerprints`, the client
+    /// takes a certificate it would turn away, and sends the token. An `encryption-key.json`
+    /// is the key for a command that was given none. The client's own home lies where other
+    /// developers' programs are kept out (`Paths.guarded`), as far as this build has such a
+    /// place, and with `PBS_MACKUP_HOME` under that folder.
+    ///
+    /// The folders the client looks in are named one by one as well, so that none is left to
+    /// what the client makes of its home: the settings (`XDG_CONFIG_HOME`, and
+    /// `XDG_CONFIG_DIRS`, which would be `/etc/xdg`), and the cache, where it notes the
+    /// repositories it was used with (`repo-list`) and keeps the files it needs for a moment.
+    /// `XDG_RUNTIME_DIR` stays unset. The client would keep the ticket of a login with a
+    /// password there; it is given the secret every time and never reads a ticket back, so
+    /// without the folder nothing that opens the server is written to disk.
     static func environment(inherited: [String: String] = ProcessInfo.processInfo.environment) -> [String: String] {
-        var environment = ["HOME": (Paths.override ?? Paths.home).path, "USER": NSUserName(), "LOGNAME": NSUserName(),
+        var environment = ["HOME": Paths.clientHome.path, "XDG_CONFIG_HOME": clientSettings.path, "XDG_CONFIG_DIRS": clientSettings.path,
+                           "XDG_CACHE_HOME": clientCache.path, "USER": NSUserName(), "LOGNAME": NSUserName(),
                            "TMPDIR": NSTemporaryDirectory(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"]
         environment["LANG"] = inherited["LANG"]
         // The client's OpenSSL looks for the trusted roots and for its settings where Homebrew
@@ -91,6 +117,30 @@ public struct Client {
         for (name, value) in inherited where name.hasPrefix("PBS_MACKUP_") { environment[name] = value }
         #endif
         return environment
+    }
+
+    /// The folders in the client's home, under the names the client would give them itself.
+    static var clientSettings: URL { Paths.clientHome.appendingPathComponent(".config") }
+    static var clientCache: URL { Paths.clientHome.appendingPathComponent(".cache") }
+
+    /// Makes the client's home and the folders in it, each for its owner alone. One that is
+    /// there already has to be a folder, not a link that leads elsewhere, and this user's;
+    /// with anything else in its place no client is started, rather than one that takes its
+    /// settings from who knows where.
+    static func makeHome() throws {
+        try FileManager.default.createDirectory(at: Paths.guarded, withIntermediateDirectories: true)
+        for folder in [Paths.clientHome, clientSettings, clientCache] {
+            if mkdir(folder.path, 0o700) == 0 { continue }
+            let reason = String(cString: strerror(errno))
+            var info = stat()
+            guard lstat(folder.path, &info) == 0 else {
+                throw Failure(description: "The client's own folder \(folder.path) could not be made (\(reason)), so no client was started.")
+            }
+            guard info.st_mode & S_IFMT == S_IFDIR, info.st_uid == getuid(),
+                  info.st_mode & 0o077 == 0 || chmod(folder.path, 0o700) == 0 else {
+                throw Failure(description: "\(folder.path) is not a folder of this user alone, so no client was started. Remove it.")
+            }
+        }
     }
 
     /// Starts the client. `--ns` is added, and `--keyfd 0` unless `usesKey` is false (not every
@@ -141,43 +191,70 @@ public struct Client {
         return limit.rlim_max
     }()
 
+    /// Starts a client, verified: the one way a client is started, for a backup as for a new
+    /// key. Its environment is `environment()` and what `variables` add, its home folder is
+    /// made first, and `input` is what it finds on its descriptors.
+    ///
     /// With a `requirement`, the client's file has to meet it before the client is started,
-    /// and the started program has to meet it before it gets the token and the key: the file
-    /// can be exchanged in between, what runs cannot. Until then the client has neither, so
-    /// the token is as safe as the key.
-    func start(_ arguments: [String], usesKey: Bool = true, mergingErrors: Bool = false,
-               signedAs requirement: SecRequirement?) throws -> Child {
+    /// and the started program has to meet it before it runs: the file can be exchanged in
+    /// between, what runs cannot. So the program starts suspended. It has not run one
+    /// instruction when it is looked at, and one that does not pass never does: it gets no
+    /// token, no key and no passphrase, and it makes no key either, which it would know.
+    /// (`passes` is how what runs is judged; the tests put a slow judge in its place.)
+    static func launch(_ executable: URL, _ arguments: [String], adding variables: [String: String] = [:],
+                       input: [Int32: Data] = [:], mergingErrors: Bool = false, terminal: Bool = false,
+                       signedAs requirement: SecRequirement?,
+                       judgedBy passes: (pid_t, SecRequirement) -> Bool = Client.runs) throws -> Child {
         if let requirement, !Signature.isSigned(executable, as: requirement) {
             throw Failure(description: "\(executable.path) is not signed the way this app's developer signs its client, so it was not started. Install the app again.")
         }
         _ = Client.openFiles
-        var environment = Client.environment()
-        environment["PBS_REPOSITORY"] = config.repository
-        environment["PBS_PASSWORD_FD"] = "3"
-        environment["PBS_FINGERPRINT"] = config.fingerprint
+        try makeHome()
+        // A client that is let run and does not begin (see `Child.resume`) has done nothing and
+        // got nothing: it is ended and started again, and looked at again. Not for ever.
+        for _ in 1...3 {
+            let child = try Child(executable, arguments, environment: environment().merging(variables) { $1 }, input: input,
+                                  mergingErrors: mergingErrors, sendingInput: false, terminal: terminal, suspended: true)
+            if let requirement, !passes(child.pid, requirement) {
+                child.closeInput()
+                // One that is gone already, ended by macOS, got nothing, and its status says how it ended.
+                guard child.isRunning else { return child }
+                child.signal(SIGKILL)
+                child.wait()
+                throw Failure(description: "The client that started is not signed the way this app's developer signs its client. It was stopped before it ran.")
+            }
+            if child.resume() {
+                child.sendInput()
+                return child
+            }
+            child.closeInput()
+            child.signal(SIGKILL)
+            child.wait()
+        }
+        throw Failure(description: "The client was started three times and did not begin to run any of them. Try again, or restart the Mac.")
+    }
+
+    /// Whether the program that runs as `pid` meets `requirement`.
+    static func runs(_ pid: pid_t, as requirement: SecRequirement) -> Bool {
+        Signature.running(pid).map { Signature.isSigned($0, as: requirement) } ?? false
+    }
+
+    /// As `start`, with the `requirement` given; see `launch` for what it asks.
+    func start(_ arguments: [String], usesKey: Bool = true, mergingErrors: Bool = false,
+               signedAs requirement: SecRequirement?) throws -> Child {
+        var variables = ["PBS_REPOSITORY": config.repository, "PBS_PASSWORD_FD": "3"]
+        variables["PBS_FINGERPRINT"] = config.fingerprint
         // The client takes the first line of what it reads from the descriptor.
         let secret = String(decoding: token, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines) + "\n"
         var input: [Int32: Data] = [3: Data(secret.utf8)]
         // A command that takes no key gets none: its standard input is empty.
         if usesKey { input[0] = key }
         if usesKey, let keyPassphrase {
-            environment["PBS_ENCRYPTION_PASSWORD_FD"] = "4"
+            variables["PBS_ENCRYPTION_PASSWORD_FD"] = "4"
             input[4] = Data((String(decoding: keyPassphrase, as: UTF8.self).trimmingCharacters(in: .newlines) + "\n").utf8)
         }
-        let child = try Child(executable, arguments + ["--ns", config.namespace] + (usesKey ? ["--keyfd", "0"] : []),
-                              environment: environment, input: input, mergingErrors: mergingErrors, sendingInput: false)
-        if let requirement {
-            guard let client = Signature.running(child.pid), Signature.isSigned(client, as: requirement) else {
-                child.closeInput()
-                // One that ended by itself got neither, and says why in its own words.
-                guard child.isRunning else { return child }
-                child.signal(SIGKILL)
-                child.wait()
-                throw Failure(description: "The client that started is not signed the way this app's developer signs its client. It was stopped before it got the token or the key.")
-            }
-        }
-        child.sendInput()
-        return child
+        return try Client.launch(executable, arguments + ["--ns", config.namespace] + (usesKey ? ["--keyfd", "0"] : []),
+                                 adding: variables, input: input, mergingErrors: mergingErrors, signedAs: requirement)
     }
 
     /// Runs to completion; returns standard output, or throws with the client's last error line.
@@ -218,9 +295,12 @@ public struct Client {
         try Client(config: candidate, token: token, needsKey: false).checkConnection()
         guard let token else { return try candidate.save() }
         let previous = try Keychain.get(.token)
-        try Keychain.set(.token, token)
-        do { try candidate.save() } catch {
-            // Both or neither: the stored configuration was not checked with the new token.
+        do {
+            try Keychain.set(.token, token)
+            try candidate.save()
+        } catch {
+            // Both or neither: the stored configuration was not checked with the new token. And
+            // where the new token did not go in, the earlier one may be out of the Keychain already.
             if let previous { try? Keychain.set(.token, previous) }
             throw error
         }

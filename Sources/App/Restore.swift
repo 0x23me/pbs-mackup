@@ -8,7 +8,9 @@ import SwiftUI
 /// does it, as the restore daemon (`RestoreService`), which this window registers for the time
 /// of the restore and takes away after. An administrator allows it with their password or
 /// Touch ID. The token, the key and its passphrase go to the daemon in its messages and are
-/// kept nowhere else.
+/// kept nowhere else; after the swap the app takes them back from the daemon and has the run
+/// tool store them (`storeSecretsAgain`). The home folder from before, which is set aside, is
+/// deleted here at Finish, as its owner: root deletes nothing in a folder that its owner can reach.
 @MainActor
 final class RestoreModel: ObservableObject {
     static let title = "Restore from a Backup"
@@ -30,9 +32,15 @@ final class RestoreModel: ObservableObject {
     @Published var confirming = false
     /// A certificate the client does not accept by itself, waiting for the owner's yes.
     @Published var unconfirmed: ServerCertificate.Info?
+    /// What Finish could not delete of the home folder set aside, waiting for the owner to
+    /// say whether to finish all the same.
+    @Published var leftBehind: Leftovers?
     private var confirmedFingerprint: String?
     private var key: Data?
     private var authorization: RestoreAuthorization?
+    /// While Finish runs. The daemon takes its right out of the authorization database then,
+    /// and a question after that would have it put the right back.
+    private var finishing = false
 
     init() {
         if let config = try? Config.load() {
@@ -55,13 +63,14 @@ final class RestoreModel: ObservableObject {
         helper = RestoreModel.daemon.status
         fullDiskAccess = FullDiskAccess.granted
         guard helper == .enabled else { state = nil; return }
+        guard !finishing else { return }
         state = try? await RestoreDaemon.status()
     }
 
     /// Asks the restore daemon's state once a second while the restore runs or waits.
     func watch() async {
         while !Task.isCancelled {
-            if let phase = state?.phase, phase == .restoring || phase == .waitingForLogout {
+            if !finishing, let phase = state?.phase, phase == .restoring || phase == .waitingForLogout {
                 state = try? await RestoreDaemon.status()
             }
             try? await Task.sleep(for: .seconds(1))
@@ -153,18 +162,59 @@ final class RestoreModel: ObservableObject {
         }
     }
 
-    /// Ends the restore: removes the folder set aside after a swap, or what was restored after a
-    /// failure, and takes the restore daemon away again.
-    func finish() async {
+    /// Ends the restore: deletes the folder set aside after a swap, has the daemon remove what
+    /// was restored after a failure, and takes the restore daemon away again. What is in the
+    /// folder set aside is deleted here, by the app as its owner, and the daemon only removes
+    /// the emptied folder from /Users. What the owner cannot delete is shown to them and not
+    /// handed to root; `leaving` finishes all the same and leaves it where it is.
+    func finish(leaving: Bool = false) async {
         message = ""
+        leftBehind = nil
+        finishing = true
+        defer { finishing = false }
         await work {
+            var left = Leftovers()
+            if let state, state.phase == .done, state.uid == getuid() {
+                left = await Task.detached { HomeRestore.emptyAside(of: state) }.value
+                guard left.isEmpty || leaving else { leftBehind = left; return }
+            }
+            let aside = state?.aside ?? ""
             try await authorized { try await RestoreDaemon.finish(authorization: $0) }
             authorization = nil
             try? await RestoreModel.daemon.unregister()
             state = nil
             choices = nil
             helper = RestoreModel.daemon.status
+            if !left.isEmpty { message = "What could not be deleted is still in \(aside)." }
         }
+    }
+
+    /// What became of the token and the key after the swap, for the window to say; nil before
+    /// `storeSecretsAgain` has run. A failure says what to do instead.
+    static var secretsStored: Result<Void, Failure>?
+
+    /// After the login that follows the swap: has the run tool store again the token and the
+    /// key the restore was started with. They were in the Keychain of the home folder that was
+    /// set aside, so the restored one has neither; the daemon kept them in its memory. Done
+    /// before anything else asks the run tool for the backups.
+    static func storeSecretsAgain() async {
+        do {
+            let secrets = try await RestoreDaemon.secrets()
+            let stored = try await RunTool.decode(SettingsModel.SetupStatus.self, ["setup-status"])
+            for step in try secrets.storing(over: stored.key) { _ = try await RunTool.call(step.arguments, input: step.input) }
+            secretsStored = .success(())
+        } catch {
+            secretsStored = .failure(Failure(description: "Enter the API token in Settings and import the recovery copy of your key: \(error)"))
+        }
+    }
+
+    /// What the owner is told when Finish could not delete everything.
+    static func explanation(of left: Leftovers, in aside: String) -> String {
+        let named = left.paths.prefix(3).map { $0.hasPrefix(aside + "/") ? String($0.dropFirst(aside.count + 1)) : $0 }
+        let items = left.count == 1 ? "1 item is" : "\(left.count.formatted()) items are"
+        return "\(items) still in \(aside), such as \(named.joined(separator: ", ")). PBS Mackup deletes your old home folder "
+            + "as you and not as root, so what you may not delete stays. Check that PBS Mackup has Full Disk Access and try again, "
+            + "or finish and remove the folder yourself: an administrator can with sudo rm -rf in Terminal."
     }
 
     /// Sends a message with the administrator's yes. It holds for five minutes
@@ -176,6 +226,9 @@ final class RestoreModel: ObservableObject {
                 authorization = nil
             }
         }
+        // The daemon puts the right into the authorization database when it starts, with the
+        // rule and the words macOS asks with. A question starts it.
+        _ = try? await RestoreDaemon.status()
         let made = try await Task.detached { try RestoreAuthorization() }.value
         authorization = made
         return try await send(made.externalForm)
@@ -216,6 +269,15 @@ enum RestoreDaemon {
         try await ask { daemon, done in
             daemon.finish(authorization: authorization) { done($0.map { .failure(Failure(description: $0)) } ?? .success(())) }
         }
+    }
+
+    static func secrets() async throws -> RestoreSecrets {
+        let data: Data = try await ask { daemon, done in
+            daemon.secrets { data, error in
+                done(data.map { .success($0) } ?? .failure(Failure(description: error ?? "The restore helper gave no answer.")))
+            }
+        }
+        return try JSONDecoder().decode(RestoreSecrets.self, from: data)
     }
 
     /// Resumes whoever waits, once: an answer and the end of the connection can both arrive.
@@ -274,6 +336,13 @@ struct RestoreView: View {
         } message: {
             Text("PBS Mackup cannot verify it with the certificate authorities that macOS ships with. Compare this fingerprint with the one on the server's dashboard:\n\n\(model.unconfirmed?.fingerprint ?? "")")
         }
+        .alert("Some of your old home folder could not be deleted", isPresented: Binding(
+            get: { model.leftBehind != nil }, set: { if !$0 { model.leftBehind = nil } })) {
+            Button("Finish Anyway") { Task { await model.finish(leaving: true) } }
+            Button("Cancel", role: .cancel) { model.leftBehind = nil }
+        } message: {
+            Text(RestoreModel.explanation(of: model.leftBehind ?? Leftovers(), in: model.state?.aside ?? ""))
+        }
         .task { if preview == nil && !Render.active { await model.refresh() } }
         .task { if preview == nil && !Render.active { await model.watch() } }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
@@ -291,7 +360,7 @@ struct RestoreView: View {
                         .font(.system(size: 34)).foregroundStyle(.tint).frame(width: 44)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Restore \(NSUserName())'s home folder").font(.headline)
-                        Text("Your files, settings and login keychain come back as they were in the backup. They take the place of this home folder when you log out. Then log in with the password from your old Mac.")
+                        Text("Your files, settings and login keychain come back as they were in the backup. They take the place of this home folder when you log out. Then log in with the password from your old Mac. PBS Mackup then stores the token and key you enter here again.")
                             .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -417,9 +486,9 @@ struct RestoreView: View {
                     }
                     .frame(maxWidth: 360)
                 }
-                if !state.notes.isEmpty && state.phase != .restoring {
+                if !notes(state).isEmpty && state.phase != .restoring {
                     VStack(alignment: .leading, spacing: 8) {
-                        ForEach(state.notes, id: \.self) { note in
+                        ForEach(notes(state), id: \.self) { note in
                             Label(note, systemImage: "checkmark")
                                 .font(.callout).foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -428,6 +497,10 @@ struct RestoreView: View {
                     .padding(14)
                     .frame(maxWidth: 440, alignment: .leading)
                     .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+                }
+                if state.phase == .done, case .failure(let failure) = RestoreModel.secretsStored {
+                    Text(failure.description).font(.callout).foregroundStyle(.red)
+                        .multilineTextAlignment(.center).frame(maxWidth: 440)
                 }
                 if !model.message.isEmpty {
                     Text(model.message).font(.callout).foregroundStyle(.red)
@@ -452,6 +525,12 @@ struct RestoreView: View {
             .padding(12)
             .background(.bar)
         }
+    }
+
+    /// What the daemon noted, and once the folder is in place, that the token and the key are stored again.
+    private func notes(_ state: RestoreState) -> [String] {
+        guard state.phase == .done, case .success = RestoreModel.secretsStored else { return state.notes }
+        return state.notes + ["Your API token and encryption key are stored on this Mac again."]
     }
 
     private func symbol(_ phase: RestoreState.Phase) -> String {
@@ -481,7 +560,7 @@ struct RestoreView: View {
         case .waitingForLogout:
             return "Everything is restored. When you log out, it takes the place of the home folder you are using now. Then log in with the password from your old Mac."
         case .done:
-            return "The home folder from before the restore is set aside. Finish deletes it and removes the restore helper."
+            return "The home folder from before the restore is set aside as \(state.aside). Finish deletes it and removes the restore helper."
         case .failed:
             return state.message ?? "Something went wrong."
         }

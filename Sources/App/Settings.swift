@@ -534,6 +534,9 @@ struct SettingsView: View {
                         Button("Save Recovery File…") { Task { await model.saveRecoveryFile() } }
                         Button("Print Paper Key…") { Task { await model.printPaperKey() } }
                         Spacer()
+                        // Also with a key in place: putting an earlier key back, say. The run tool
+                        // has the owner confirm before one key takes the place of another.
+                        if !key.foreign { Button("Import Existing Key…") { Task { await model.importKey() } } }
                         Button("Replace Key…", role: .destructive) { model.confirmingReplacement = true }
                     }
                     .confirmationDialog("Replace the encryption key?", isPresented: $model.confirmingReplacement) {
@@ -557,7 +560,7 @@ struct SettingsView: View {
             } header: {
                 Text("Encryption key")
             } footer: {
-                Text("Backups are encrypted on this Mac. Without the key or its recovery copy nobody can read them, you included. To read earlier backups on a new Mac, import the recovery copy.")
+                Text("Backups are encrypted on this Mac. The key is random, not a password: the app makes it and keeps it in your Keychain, so backups run without asking. The recovery copy is the only other copy. Without the key or that copy nobody can read the backups, you included. On a new Mac, import the recovery copy.")
                     .multilineTextAlignment(.leading).frame(maxWidth: .infinity, alignment: .leading)
             }
         }

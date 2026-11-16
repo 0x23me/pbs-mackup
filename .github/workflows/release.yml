@@ -11,6 +11,10 @@
 #   DEVELOPER_ID_CERTIFICATE_PASSWORD  the password of that .p12
 #   NOTARY_KEY                         an App Store Connect API key, the content of its AuthKey_….p8
 #   NOTARY_KEY_ID, NOTARY_ISSUER       that key's ID and its issuer ID
+#   RUN_TOOL_PROFILE                   the Developer ID provisioning profile of the run tool
+#                                      (<bundle identifier>.tool, with Keychain Sharing), made for the
+#                                      certificate above, base64: base64 -i ….provisionprofile.
+#                                      Without it no release is built
 #   TAP_TOKEN                          a token that can push to 0x23me/homebrew-tap; without it the
 #                                      cask is only kept as an artifact of the run
 name: Release
@@ -109,11 +113,16 @@ jobs:
           NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
           PBS_MACKUP_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           PBS_MACKUP_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+          RUN_TOOL_PROFILE: ${{ secrets.RUN_TOOL_PROFILE }}
         run: |
+          # Without the profile the run tool would keep the token and the key in the login keychain.
+          [ -n "$RUN_TOOL_PROFILE" ] || { echo "::error::no RUN_TOOL_PROFILE secret, see the head of this file"; exit 1; }
           export PBS_MACKUP_NOTARY_KEY="$RUNNER_TEMP/notary.p8"
+          export PBS_MACKUP_RUN_TOOL_PROFILE="$RUNNER_TEMP/run-tool.provisionprofile"
+          trap 'rm -f "$PBS_MACKUP_NOTARY_KEY" "$PBS_MACKUP_RUN_TOOL_PROFILE"' EXIT
           printf '%s\n' "$NOTARY_KEY" > "$PBS_MACKUP_NOTARY_KEY"
+          printf '%s' "$RUN_TOOL_PROFILE" | base64 --decode > "$PBS_MACKUP_RUN_TOOL_PROFILE"
           ./Scripts/release.sh "$VERSION"
-          rm "$PBS_MACKUP_NOTARY_KEY"
 
       - name: Remove the signing keychain
         if: always()

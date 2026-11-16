@@ -146,17 +146,19 @@ public struct State: Codable, Equatable {
     /// before it was noted, which the next run takes as none on record.
     public var lastFullRead: Date?
     public var history: [RunRecord] = []
-    /// Not in use any more: the pause is a file of its own, see `Pause`. A `true` from before
-    /// that is moved there by the next run. The field is still written, as `false`, for an
-    /// app from before that is still running and cannot read the file without it.
-    var paused = false
+    /// Not in use: the pause is a file of its own, see `Pause`, and nothing here reads this.
+    /// The field is still written, always as `false`, because the versions 0.2 to 0.5 cannot
+    /// read a state file without it: an app of one of them that is still running after an
+    /// update would show no backups at all.
+    private(set) var paused = false
 
     public init() {}
 
     public static func load(from url: URL = Paths.state) -> State {
-        guard let data = try? Data(contentsOf: url), let state = try? JSONDecoder.iso8601.decode(State.self, from: data) else {
+        guard let data = try? Data(contentsOf: url), var state = try? JSONDecoder.iso8601.decode(State.self, from: data) else {
             return State()
         }
+        state.paused = false
         return state
     }
 

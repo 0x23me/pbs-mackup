@@ -72,7 +72,7 @@ public struct FolderSizes: Codable, Equatable, Sendable {
 
     public func save() throws -> URL {
         let file = FolderSizes.file(for: path)
-        try FileManager.default.createDirectory(at: Paths.sizes, withIntermediateDirectories: true)
+        try Paths.createLeftOutOfBackups(Paths.sizes)
         try JSONEncoder.iso8601.encode(self).write(to: file, options: .atomic)
         // Folder names are private; the file is the owner's alone.
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)

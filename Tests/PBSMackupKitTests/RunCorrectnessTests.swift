@@ -283,31 +283,29 @@ extension PrivateHomeTests {
         #expect(!Pause.isOn)
     }
 
-    @Test func aPauseKeptInTheStateFileMovesToItsOwnFile() throws {
+    @Test func aPauseInTheStateFileIsWrittenForOlderVersionsAndNeverRead() throws {
         let home = FileManager.default.temporaryDirectory.appendingPathComponent("pbs-mackup-pause-\(UUID().uuidString)")
         setenv("PBS_MACKUP_HOME", home.path, 1)
         defer { unsetenv("PBS_MACKUP_HOME"); try? FileManager.default.removeItem(at: home) }
         let config = unreachable(home: home)
         try Seal.set(config: config)
+        func written() throws -> String { String(decoding: try Data(contentsOf: Paths.state), as: UTF8.self) }
 
-        // As an earlier version left it: paused, in the state file.
+        // The versions 0.2 to 0.5 cannot read a state file without the field.
         var old = State()
         old.finish(record(.success, at: Date().addingTimeInterval(-7200)))
-        old.paused = true
         try old.save()
-        #expect(String(decoding: try Data(contentsOf: Paths.state), as: UTF8.self).contains(#""paused" : true"#))
-        old = State.load()
-        #expect(!Pause.isOn)
+        #expect(try written().contains(#""paused" : false"#))
+        // As a version before 0.2 left it, or as another program wrote it: paused, in the state file.
+        try Data(try written().replacingOccurrences(of: #""paused" : false"#, with: #""paused" : true"#).utf8).write(to: Paths.state)
+        #expect(State.load().last != nil && !State.load().paused)
 
-        #expect(Runner(config: config, trigger: .scheduled).run() == .done)
-        #expect(Pause.isOn)                             // still paused, now by the file,
-        #expect(State.load().paused == false)           // and no longer by the field,
-        #expect(State.load().last == old.last)          // and the run that was due did not happen
-        // so that resuming is not undone by the next run.
-        try Pause.set(false)
+        // Nothing is paused by it: the run that was due is tried,
         #expect(Runner(config: config, trigger: .scheduled).run() == .done)
         #expect(!Pause.isOn)
         #expect(State.load().last?.outcome == .skipped)
+        // and the field is `false` again.
+        #expect(try written().contains(#""paused" : false"#))
     }
 
     @Test func aRowOfSkipsIsOneRecordAndEveryTickTriesAgain() throws {

@@ -4,15 +4,12 @@ import PBSMackupKit
 
 // `restore-home`: the whole home folder of a user back from a backup, on a Mac that was set up
 // anew. Run with sudo from the account of another administrator; README "After losing the Mac".
+// That it runs as root, and not for the app, is what its entry in `commands` says.
 
 let restoreHomeArguments = "<user> <repository> <key file> [--ns <namespace>] [--from <backup id> | --snapshot <snapshot>] "
     + "[--archive <folder>.pxar] [--fingerprint <fingerprint>] [--yes]"
 
 func restoreHome(_ call: Call) throws -> Data {
-    guard call.caller == .terminal else { throw Failure(description: "restore-home is run from a terminal, not by the app.") }
-    guard geteuid() == 0 else {
-        throw Failure(description: "restore-home needs root: run it with sudo, from the account of another administrator.")
-    }
     var positional: [String] = [], options: [String: String] = [:], yes = false
     var rest = call.arguments.dropFirst()
     while let argument = rest.popFirst() {
@@ -50,34 +47,32 @@ func restoreHome(_ call: Call) throws -> Data {
     let archive = options["--archive"] ?? Config.archiveName(for: account.home.path)
     let snapshot = try HomeRestore.choose(from: client.snapshots(group: nil), archive: archive,
                                           requested: options["--snapshot"], group: options["--from"])
-    let restored = URL(fileURLWithPath: account.home.path + ".restored")
-    let aside = URL(fileURLWithPath: account.home.path + ".before-restore")
-    for item in [restored, aside] where FileManager.default.fileExists(atPath: item.path) {
-        throw Failure(description: "\(item.path) is there already, from an earlier try. Move it out of the way first.")
-    }
-    if let size = snapshot.size, let free = HomeRestore.freeBytes(at: URL(fileURLWithPath: "/Users")), free < size + size / 10 {
-        throw Failure(description: "The snapshot takes \(bytes(size)), and the disk has \(bytes(free)) free.")
-    }
+    // The user is logged out now and can log in while the restore runs: it works in a folder
+    // only root can enter, as the restore daemon does.
+    let places = HomeRestore.Places(home: account.home)
+    try HomeRestore.preflight(places, size: snapshot.size)
 
     print("""
         Restoring \(archive) from \(snapshot.name)\(snapshot.size.map { " (\(bytes($0)))" } ?? "")
         into \(account.home.path), the home folder of \(account.name) (uid \(account.uid)).
-        The folder that is there now is kept as \(aside.path).
+        The folder that is there now is kept as \(places.aside.path).
         """)
     if !yes {
         print("Go ahead? [y/N] ", terminator: "")
         guard let answer = readLine(), answer.lowercased().hasPrefix("y") else { return Data("Nothing was changed.".utf8) }
     }
 
-    try HomeRestore.restore(client, snapshot: snapshot.name, archive: archive, into: restored) { FileHandle.standardOutput.write($0) }
+    try HomeRestore.restore(client, snapshot: snapshot.name, archive: archive, into: places) { FileHandle.standardOutput.write($0) }
 
-    let notes = HomeRestore.adapt(restored, to: account)
+    let notes = HomeRestore.adapt(places.restored, to: account)
 
-    try HomeRestore.swap(home: account.home, restored: restored, aside: aside)
+    try HomeRestore.swap(places)
     return Data((notes + ["""
         Done. \(account.home.path) is the restored home folder.
         Restart, log in as \(account.name) with the password the old Mac had (it opens the old login keychain),
-        and give PBS Mackup Full Disk Access again. Once everything is there, delete \(aside.path) and this administrator.
+        and give PBS Mackup Full Disk Access again. Enter the API token in its Settings and import the recovery copy
+        of the key: they stayed in the Keychain of the old Mac. Once everything is there, delete \(places.aside.path)
+        and this administrator.
         """]).joined(separator: "\n").utf8)
 }
 

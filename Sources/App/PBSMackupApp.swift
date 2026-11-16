@@ -1,5 +1,4 @@
 import AppKit
-import os
 import PBSMackupKit
 import ServiceManagement
 import SwiftUI
@@ -65,10 +64,13 @@ private struct MenuBarLabel: View {
     }
 
     /// After the login that follows a restore, or a restore that failed, the restore window
-    /// opens by itself: the owner finishes there, and the restore helper goes away.
+    /// opens by itself: the owner finishes there, and the restore helper goes away. After the
+    /// swap the token and the key are stored again first, which the window then reports and the
+    /// login items need.
     private func openUnfinishedRestore() async {
         guard RestoreModel.daemon.status == .enabled, let state = try? await RestoreDaemon.status(),
               state.phase == .done || state.phase == .failed else { return }
+        if state.phase == .done { await RestoreModel.storeSecretsAgain() }
         openWindow(id: "restore")
         NSApp.activate(ignoringOtherApps: true)
         if state.phase == .done { await offerLoginItems(of: state.snapshot) }
@@ -116,12 +118,6 @@ final class StatusModel: ObservableObject {
         if Shot.request == nil { registerJobs() }
         #else
         registerJobs()
-        // The token and the key of a version before 0.2 move to where this version keeps them;
-        // macOS asks for the login password for each. Nothing happens when there are none.
-        Task { [weak self] in
-            _ = try? await RunTool.call(["migrate"])
-            await MainActor.run { self?.reload() }
-        }
         #endif
         // The state file, the configuration and the pause file are all written into the support
         // folder, so a change there says when to read them again. The timer is for what no such
@@ -216,14 +212,6 @@ final class StatusModel: ObservableObject {
         let defaults = UserDefaults.standard
         let changed = defaults.string(forKey: "registeredJob") != registered
         defaults.set(registered, forKey: "registeredJob")
-        // The job of a version before 0.2, which launchd no longer starts; see `Identity.legacyLabel`.
-        // Its description is still in the bundle for this alone.
-        let old = SMAppService.agent(plistName: "\(Identity.legacyLabel).plist")
-        if old.status == .enabled || old.status == .requiresApproval {
-            let log = Logger(subsystem: Identity.bundleID, category: "jobs")
-            do { try old.unregister(); log.notice("the job of an earlier version is unregistered") }
-            catch { log.notice("the job of an earlier version: \(error.localizedDescription, privacy: .public)") }
-        }
         for job in Identity.jobs {
             let service = SMAppService.agent(plistName: "\(job).plist")
             if service.status == .enabled, changed { try? service.unregister() }
@@ -256,8 +244,7 @@ final class StatusModel: ObservableObject {
     }
 
     func openLog() {
-        if let log = state.last?.log { NSWorkspace.shared.open(URL(fileURLWithPath: log)) }
-        else { NSWorkspace.shared.open(Paths.logs) }
+        NSWorkspace.shared.open(Paths.logToOpen(state.last?.log))
     }
 
     static func openFullDiskAccess() {

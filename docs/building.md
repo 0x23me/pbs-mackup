@@ -41,14 +41,40 @@ entitlement `com.apple.security.application-groups` for `<Team ID>.<bundle ident
 `bundle.sh` writes from the Team ID in the signature. A release build starts only a client
 signed by the same team as `pbs-mackup-run` and under the client's own identifier
 (`<bundle identifier>.client`), and checks the started client again
-before it hands over the key.
+before it lets it run: every client starts suspended (`Client.launch`), also the one that
+makes a new key, which gets no input that could be held back.
+
+With `PBS_MACKUP_RUN_TOOL_PROFILE=<file>` the run tool keeps the token and the key in the data
+protection keychain, in the access group `<Team ID>.<bundle identifier>`, where macOS lets no
+program of another developer read, make, replace or delete an item. macOS lets a program into
+such a group only by a provisioning profile, and looks for the profile in the bundle the
+program is the main program of. So the run tool gets a bundle of its own inside the app,
+`Contents/Helpers/PBSMackupRun.app`, with the profile as `Contents/embedded.provisionprofile`
+and the entitlements `com.apple.application-identifier`, `com.apple.developer.team-identifier`
+and `keychain-access-groups`. The launchd jobs start it there, and
+`Contents/MacOS/pbs-mackup-run` is a link to it, so the path for the terminal stays. The run
+tool finds the app from where it lies (`Identity.app`), and asks macOS whether it is in the
+group (`Keychain.place`); it does not go by the path. The profile is a Developer ID profile
+from the developer's account, for the App ID `<bundle identifier>.tool` with Keychain Sharing
+and for the certificate that signs. `bundle.sh` checks that it is for this identifier, this
+team and this certificate, allows the group and has not expired, and starts the built tool
+once: macOS ends a program at once whose profile does not agree with what it asks for.
+A release is always built this way. Without the variable the run tool lies in
+`Contents/MacOS` itself and keeps the token and the key in the login keychain, as up to 0.5.0;
+that is what a build signed ad hoc and a build by someone without such a profile get. A build
+with a profile moves the items of a build without one into its keychain
+([reference](reference.md#files)); a build without one does not find them there. Keychain
+items are not touched by the tests.
 
 `pbs-mackup-run` is signed as `<bundle identifier>.tool`, and that name is a promise. The
-Keychain hands the token and the key to the program that stored them, which it knows by this
+login keychain hands the token and the key to the program that stored them, which it knows by this
 name and the developer, not by a version: every run tool ever released under the name can
-read them for good. So a run tool must never hand a secret, or what it unlocks, to a caller it
+read what is there for good, and every run tool with a profile under the name is in the access
+group. So a run tool must never hand a secret, or what it unlocks, to a caller it
 has not checked. The tools before 0.2 did (they signed as `.run`); if one ever has to be given
-up again, it needs a new name, and `Keychain.migrate` shows how the items follow. The launchd
+up again, it needs a new name. The items do not follow by themselves then: an item under the
+old name is one any program could have put there, so the owner enters the token again and
+imports the recovery copy of the key. The launchd
 jobs need new names then as well: launchd remembers for a job's name which program it may
 start, by the name that program was signed as when the job was first registered, and refuses
 any other ("Launch Constraint Violation") also after the job is registered again. That is why
@@ -59,13 +85,22 @@ The bundle has three launchd jobs in `Contents/Library/LaunchAgents`, all of the
 job) and `.helper` (the service the app talks to). The app registers them when it starts, and
 again when it moved or was built anew, because launchd starts only the run tool it found when
 the jobs were registered. A build signed ad hoc (`PBS_MACKUP_SIGN_IDENTITY=-`) has no team: no
-entitlement, the snapshot is mounted in the cache, and the client's signature is not checked.
+entitlement, the snapshot is mounted in the cache, where the lists of file names and the
+client's home folder (`Paths.clientHome`) are kept as well and any program of the user can
+write, and the client's signature is not checked. Its helper has no signature to know the app
+by, and any program of the user can connect to it, so it asks for Touch ID or the login
+password for what the run tool asks for when it is started from a terminal: listing or
+searching backups, restoring, measuring a folder, saving the settings. It asks once for each
+running program that connects, so the app is asked once until it quits and another program is
+asked about anew; what changes or hands out the key asks every time.
 
 A debug build (`swift build`, the tests) also takes `clientPath` from the configuration,
 `PBS_MACKUP_CLIENT` and `PBS_MACKUP_HOME`. It has no helper job: the app starts the run tool as
-a program and sets `PBS_MACKUP_APP`, so that the tool does not ask to confirm. The app that
-`just bundle` builds ignores all four, runs only the client inside it and asks its run tool
-only through the helper job.
+a program and sets `PBS_MACKUP_APP`, so that the tool does not ask to confirm. For the tests,
+`PBS_MACKUP_APP=unchecked` puts the caller in the place of whoever connects to the helper of an
+ad-hoc build, and `PBS_MACKUP_CONFIRM=refuse` answers no wherever the tool would ask. The app
+that `just bundle` builds ignores all of these, runs only the client inside it and asks its run
+tool only through the helper job.
 
 The app is signed with the same identity and identifier on every build, so Full Disk Access
 and the Keychain items stay valid across rebuilds and reinstalls. Use one copy at a time: the
@@ -112,11 +147,12 @@ just release 0.1.1
 
 builds, signs and notarizes `dist/PBSMackup-0.1.1.zip`, and writes the Homebrew cask for it to
 `dist/pbs-mackup.rb`. It needs a notarytool keychain profile (`PBS_MACKUP_NOTARY_PROFILE`, `pbs-mackup`
-when not set), stored once with `xcrun notarytool store-credentials`. Attach the zip to the
+when not set), stored once with `xcrun notarytool store-credentials`, and the run tool's
+provisioning profile in `PBS_MACKUP_RUN_TOOL_PROFILE`; without that no release is made. Attach the zip to the
 GitHub release `v0.1.1` and copy the cask into the tap's `Casks` folder.
 
-`PBS_MACKUP_BUNDLE_ID` sets the bundle identifier, which is also the Keychain service and, with
-`.run` appended, the launchd job. Changing it makes a different app as far as macOS is
+`PBS_MACKUP_BUNDLE_ID` sets the bundle identifier, from which the Keychain service (`.tool`),
+the keychain access group and the launchd jobs (`.scheduled`, `.manual`, `.helper`) take their names. Changing it makes a different app as far as macOS is
 concerned: Full Disk Access and the Keychain items belong to the old one.
 
 `just icon` redraws the icon from `Scripts/icon.swift`.

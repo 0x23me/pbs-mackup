@@ -73,8 +73,9 @@ The app lives in the menu bar. Settings has three tabs:
    own CA, even when your Keychain trusts it. Nothing is saved until the server has accepted
    the connection.
 2. **Encryption Key.** Make a key, then save the recovery file or print the paper key and keep
-   it somewhere that isn't this Mac. Without the key or that copy nobody can read the backups,
-   you included. After a reinstall, import the copy. Saving the recovery file, printing the
+   it somewhere that isn't this Mac. The key is random, not a password: the app makes it and
+   keeps it in your Keychain, so backups run without asking. Without the key or that copy
+   nobody can read the backups, you included. After a reinstall, import the copy. Saving the recovery file, printing the
    paper key and replacing the key ask for Touch ID or your password. A key file that has a
    passphrase asks for it once; the key is then stored without it, since a backup that runs by
    itself has nobody to ask. The file keeps its passphrase.
@@ -88,14 +89,31 @@ Then switch on Full Disk Access for PBS Mackup in System Settings. Without it th
 mount a snapshot of the disk and reads the live folders instead, and such a run stops when a
 file changes while it is read, which in a whole home folder is likely.
 
-The token secret and the key are kept in your login Keychain; [what is protected](#what-is-protected)
+The token secret and the key are kept in your Keychain; [what is protected](#what-is-protected)
 says from whom.
 
 ### Coming from 0.1
 
-0.2 keeps the token and the key in Keychain items of its own, which the run tool of the earlier
-versions cannot read. When it first starts, macOS asks for your login password, once for each,
-to move them there. Back Up Now, the Backups window and the settings work as before.
+Since 0.2 the token and the key are in Keychain items of their own, which the run tool of the
+earlier versions cannot read. Nothing is taken over from where 0.1 kept them, because any
+program can put an item there: enter the token again and import the recovery copy of your key
+in Settings. Then delete the old items, which the run tool of 0.1 handed to whoever asked:
+
+```sh
+security delete-generic-password -s me.0x23.pbs-mackup -a token
+security delete-generic-password -s me.0x23.pbs-mackup -a encryption-key
+```
+
+The backup job of 0.1 (`me.0x23.pbs-mackup.run`) may stay registered. launchd does not start
+it any more.
+
+### Coming from 0.2 to 0.5
+
+Those versions kept the token and the key in the login Keychain, where a program that runs as
+you could delete them or put its own in their place. Now they are in a part of the Keychain
+that macOS opens to this app's run tool alone. The first backup or the first look at the
+settings moves them there; there is nothing to do. An earlier version does not find them any
+more: after going back to one, enter the token again and import the recovery copy of your key.
 
 ## Getting things back
 
@@ -106,7 +124,7 @@ Right-click a file for its versions. Command-F searches the names of the whole s
 ### After losing the Mac
 
 The whole home folder comes back on a freshly installed Mac, and you log in to it as before:
-files, settings, the login keychain, and PBS Mackup with its settings and key.
+files, settings, the login keychain, and PBS Mackup with its settings.
 
 1. Install macOS. In Setup Assistant, make your account with the same short name as before
    (`me`) and your old password, which the old login keychain opens with.
@@ -116,14 +134,25 @@ files, settings, the login keychain, and PBS Mackup with its settings and key.
 3. **Find Backups** has an administrator allow the restore and picks the newest snapshot;
    **Restore…** starts it. You can keep working meanwhile, but what you save in this account
    until you log out is set aside.
-4. When it says so, log out and log in again. The restored home folder is in place; **Finish**
-   deletes the one from before and removes the helper.
+4. When it says so, log out and log in again. The restored home folder is in place, and PBS
+   Mackup stores the token and the key you entered in step 2 again: the Keychain they were in
+   only opens on the old Mac. **Finish** deletes the folder from before and removes the helper,
+   and backups go on.
+
+If the Mac restarts between the restore and logging in again, the token and the key are gone
+with the helper's memory. The window says so: enter the token in Settings and import the
+recovery copy of the key.
 
 The restore helper is the part of PBS Mackup that runs as root. It is only registered while you
 restore, takes messages from the app alone, and does nothing without an administrator's password
-or Touch ID. From a terminal, the same works with `sudo pbs-mackup-run restore-home me
+or Touch ID. It restores inside a folder that only root can open, `/Users/.pbs-mackup-restore-me`,
+and deletes nothing in a folder of yours: the home folder from before, which waits as
+`/Users/me.before-restore` until you finish, is deleted by the app, as you. What you may not
+delete there stays, and Finish says so. From a terminal, the same works with `sudo pbs-mackup-run restore-home me
 'mac@pbs!backup@pbs.example.net:store' key.json --ns mac`, run from another administrator's
-account while `me` is logged out.
+account while `me` is logged out. That way the token and the key are not stored for you: root
+can't reach your Keychain. Enter the token in Settings and import the recovery copy after you
+log in.
 
 With [Mac Settings](#mac-settings-beta) switched on, the app then offers to add your login items back.
 
@@ -191,8 +220,15 @@ rm -rf ~/Library/Application\ Support/pbs-mackup ~/Library/Caches/pbs-mackup \
   ~/Library/Group\ Containers/*.me.0x23.pbs-mackup
 ```
 
-The key and the token stay in the login Keychain (under `me.0x23.pbs-mackup.tool`), the
-backups on the server.
+`brew uninstall --zap --cask pbs-mackup` removes these too, and what a restore of the whole home
+folder left when it was not finished: the restore helper's right in the authorization database
+(`me.0x23.pbs-mackup.restore-home`), its state in `/Library/Application Support/me.0x23.pbs-mackup`
+and the folder it restored in, `/Users/.pbs-mackup-restore-<you>`. A restore that was finished
+has removed all three itself.
+
+The key and the token stay in the Keychain, the
+backups on the server, and a home folder that a restore set aside, `/Users/<you>.before-restore`,
+where it is.
 
 ## What's inside
 
@@ -210,7 +246,8 @@ Files and settings: [docs/reference.md](docs/reference.md). Building it:
   never sees, file names included. The token can add backups and fetch this Mac's own, still
   encrypted; it can't delete or prune.
 - The backups and the key, from other programs on the Mac: macOS hands the token and the key
-  only to the app's run tool, and the run tool takes requests only from the app, which macOS
+  only to the app's run tool, and lets no other developer's program read, replace or delete
+  them. The run tool takes requests only from the app, which macOS
   checks by its signature. Started by anything else, at a terminal say, it asks for Touch ID or
   your password before it lists or restores anything or changes the settings, the token or the
   key. It gives the key to nothing but the client it came with, checked by its signature too,
@@ -218,16 +255,19 @@ Files and settings: [docs/reference.md](docs/reference.md). Building it:
 - What is backed up and where to, from other programs: a run goes only by settings the app
   saved and by a key the app stored. It notes both in a folder where macOS asks you before it
   lets another developer's program in. When `config.json` or the key in the Keychain is not what
-  was noted, nothing is backed up or read, and the menu says why.
+  was noted, nothing is backed up or read, and the menu says why. The same when nothing is
+  noted, as after that folder was removed: what happens to be there is not taken over. Done in
+  Settings notes the settings again, importing the recovery copy notes the key.
 - The frozen snapshot, which holds a copy of Mail, Messages and everything else in your home
-  folder, and the files a run restores to check them: both are in that same folder.
-- Not from a program that runs as you and only wants to be in the way. It can pause backups,
-  delete the token and the key from the Keychain, or rewrite the state file. Backups then stop
+  folder, the files a run restores to check them, and the lists of file names that searching a
+  backup and measuring a folder leave behind: all are in that same folder.
+- Not from a program that runs as you and only wants to be in the way. It can pause backups
+  or rewrite the state file. Backups then stop
   or fail and the menu says so; nothing gets out.
 - Not what you are looking at: a file opened from the Backups window is an ordinary copy in the
   cache until the window closes.
 - Not from the versions before 0.2 as long as their Keychain items exist: those handed the key
-  to whoever asked. 0.2 moves the items out of their reach when it first starts. If an earlier
+  to whoever asked. Delete those items ([coming from 0.1](#coming-from-01)). If an earlier
   version ran on a Mac you don't trust, make a new key.
 - Not from anything that has Full Disk Access or is root, and not from a program you let in
   when macOS asks.

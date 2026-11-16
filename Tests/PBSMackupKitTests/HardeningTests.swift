@@ -63,16 +63,21 @@ private struct Home {
         try Data(text.utf8).write(to: folder.appendingPathComponent(name))
     }
 
-    /// Starts the pbs-mackup-run of the debug build in this home.
-    func runTool(_ arguments: [String]) throws -> (status: Int32, output: String, errors: String) {
+    /// Starts the pbs-mackup-run of the debug build in this home. `who` says who asks and what
+    /// the owner answers, see `asTheApp`; a file stands in for standard input.
+    func runTool(_ arguments: [String], _ who: [String: String] = [:], input: Data? = nil) throws -> (status: Int32, output: String, errors: String) {
         let process = Process(), output = Pipe(), errors = Pipe()
         process.executableURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().appendingPathComponent(".build/debug/pbs-mackup-run")
         process.arguments = arguments
-        process.environment = ProcessInfo.processInfo.environment.merging(["PBS_MACKUP_HOME": folder.path]) { $1 }
+        process.environment = ProcessInfo.processInfo.environment.merging(["PBS_MACKUP_HOME": folder.path]) { $1 }.merging(who) { $1 }
         process.standardOutput = output
         process.standardError = errors
         process.standardInput = FileHandle.nullDevice
+        if let input {
+            try input.write(to: folder.appendingPathComponent("input"))
+            process.standardInput = try FileHandle(forReadingFrom: folder.appendingPathComponent("input"))
+        }
         try process.run()
         let printed = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         let complaints = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
@@ -83,6 +88,40 @@ private struct Home {
 
 private func failure(_ work: () throws -> Void) -> String? {
     do { try work(); return nil } catch { return "\(error)" }
+}
+
+/// Who asks the run tool, said the way a debug build takes it in the place of the helper's
+/// connection: the app as macOS has checked it, and whoever connects to the helper of a build no
+/// developer signed. Without either, the tool was started as from a terminal.
+private let asTheApp = ["PBS_MACKUP_APP": "1"], unchecked = ["PBS_MACKUP_APP": "unchecked"]
+/// The owner says no wherever the tool would ask with Touch ID; the error then names the question.
+private let saysNo = ["PBS_MACKUP_CONFIRM": "refuse"]
+
+@Test func onlyABuildADeveloperSignedKnowsWhoConnectsToItsHelper() {
+    #expect(HelperConnection.checksCaller(signedBy: .team("33C888LZ98")))
+    #expect(!HelperConnection.checksCaller(signedBy: .nobody))               // signed ad hoc: anyone can connect
+    #expect(!HelperConnection.checksCaller(signedBy: .unknown))
+}
+
+@Test func whatAnEarlierVersionKeptInTheCacheIsRemovedOnce() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("pbs-mackup-cache-\(UUID().uuidString)")
+    let cache = folder.appendingPathComponent("cache"), guarded = folder.appendingPathComponent("group")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    func fill() throws {
+        for name in ["index", "sizes", "preview", "changes"] {
+            try FileManager.default.createDirectory(at: cache.appendingPathComponent(name), withIntermediateDirectories: true)
+            try Data("Library/Mail".utf8).write(to: cache.appendingPathComponent(name).appendingPathComponent("names.json"))
+        }
+        for name in ["changed-folders", "settings.json", "run.lock"] { try Data().write(to: cache.appendingPathComponent(name)) }
+    }
+    try fill()
+    // A build without a group container still keeps them there.
+    Paths.removeNames(from: cache, nowIn: cache)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: cache.path).count == 7)
+    // With one, the files that hold names go; the lock, the change log's marker and what is open to look at stay.
+    Paths.removeNames(from: cache, nowIn: guarded)
+    #expect(try FileManager.default.contentsOfDirectory(atPath: cache.path).sorted() == ["changes", "preview", "run.lock"])
+    Paths.removeNames(from: cache, nowIn: guarded)                          // nothing left to remove
 }
 
 @Test func aRequirementNamesOneProgramOfTheDeveloper() {
@@ -154,15 +193,37 @@ extension PrivateHomeTests {
     try Keychain.set(.encryptionKey, Data("NEW".utf8))
     _ = try Client(config: home.config)
 
-    // What was there before there was a seal is taken over when the app asks for it, once.
+}
+
+@Test func withoutASealNothingThatIsThereIsTakenOver() throws {
+    let home = try Home()
+    defer { home.remove() }
+    let key = Data(#"{"kdf":null,"data":"S0VZ","fingerprint":"aa:bb"}"#.utf8)
+    try Keychain.set(.encryptionKey, key)
+    _ = try Client(config: home.config)
+
+    // The seal is gone, or there never was one: whoever saw to that may have put a
+    // configuration and a key of their own in place, so neither is noted just for being there,
+    // whatever is started.
     try FileManager.default.removeItem(at: Paths.seal)
     #expect(failure { _ = try Client(config: home.config) } == Seal.keyChanged)
-    try Seal.adopt()
-    _ = try Client(config: home.config)
-    #expect(Seal.holds(home.config))
-    try Data("SOMEONE ELSE'S".utf8).write(to: home.folder.appendingPathComponent("secrets/encryption-key"))
-    try Seal.adopt()                                                 // not a second time
-    #expect(failure { _ = try Client(config: home.config) } == Seal.keyChanged)
+    #expect(try KeyStore.status().foreign)
+    #expect(try home.runTool(["setup-status"]).status == 0)
+    #expect(try home.runTool(["snapshots"]).errors == Seal.configChanged + "\n")
+    #expect(try home.runTool(["--manual"]).status == Runner.Exit.notConfigured.rawValue)
+    #expect(!FileManager.default.fileExists(atPath: Paths.seal.path))
+    // Taking over what an earlier version left is no command any more.
+    let migrate = try home.runTool(["migrate"])
+    #expect(migrate.status == 64 && migrate.output.hasPrefix("usage:"))
+    #expect(!FileManager.default.fileExists(atPath: Paths.seal.path))
+
+    // The owner says which ones count: the configuration with `seal` or with Done,
+    #expect(try home.runTool(["seal"]).status == 0)
+    #expect(Seal.holds(home.config) && !Seal.holds(key: key))
+    #expect(try home.runTool(["snapshots"]).errors == Seal.keyChanged + "\n")
+    // the key by importing the recovery copy.
+    #expect(try KeyStore.importKey(key) == KeyStore.Status(present: true, fingerprint: "aa:bb", created: nil))
+    #expect(try home.runTool(["snapshots"]).output == "[]\n")
 }
 
 @Test func aLockedFileIsRestoredAndStaysLocked() throws {
@@ -184,6 +245,81 @@ extension PrivateHomeTests {
     #expect(second.lastPathComponent == "letter 2.txt" && isLocked(second) && isLocked(restored))
     // Nothing of the restore is left beside them.
     #expect(try FileManager.default.contentsOfDirectory(atPath: target.path).sorted() == ["letter 2.txt", "letter.txt"])
+}
+
+@Test func whatAStoppedCommandLeftIsRemovedAndWhatIsInUseStays() throws {
+    let home = try Home()
+    defer { home.remove() }
+    try Paths.createFolders()
+    func there(_ item: URL) -> Bool { FileManager.default.fileExists(atPath: item.path) }
+    /// What a command leaves that is killed, or a Mac that loses power: a key on its way into
+    /// the Keychain, and the files of a check, one of them locked as it was backed up.
+    func leave() throws -> [URL] {
+        let key = Paths.guarded.appendingPathComponent("key-\(UUID().uuidString)")
+        let check = Paths.guarded.appendingPathComponent("check-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: key, withIntermediateDirectories: true)
+        try Data("KEY".utf8).write(to: key.appendingPathComponent("key"))
+        let letter = check.appendingPathComponent("0/letter.txt")
+        try FileManager.default.createDirectory(at: letter.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("from the backup".utf8).write(to: letter)
+        #expect(lchflags(letter.path, UInt32(UF_IMMUTABLE)) == 0)
+        return [key, check]
+    }
+    let left = try leave()
+
+    // A folder this program is using, and one that another program is using: the run tool
+    // makes a key, as the helper does for the app, and its client takes its time over it. That
+    // command holds no lock a run would wait for.
+    let mine = try Scratch(.check)
+    try Data("restored".utf8).write(to: mine.folder.appendingPathComponent("file"))
+    let slow = home.folder.appendingPathComponent("bin/slow-client")
+    try Data(#"""
+        #!/bin/sh
+        home="$PBS_MACKUP_HOME"
+        /usr/bin/dirname "$3" > "$home/key-folder.part"
+        /bin/mv "$home/key-folder.part" "$home/key-folder"
+        until [ -e "$home/go-on" ]; do sleep 0.05; done
+        umask 077
+        printf '%s' '{"kdf":null,"data":"bm90IGEgcmVhbCBrZXk=","fingerprint":"aa:bb:cc"}' > "$3"
+        """#.utf8).write(to: slow)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: slow.path)
+    var config = home.config
+    config.clientPath = slow.path
+    try config.save()
+    let making = Process()
+    making.executableURL = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        .deletingLastPathComponent().appendingPathComponent(".build/debug/pbs-mackup-run")
+    making.arguments = ["create-key", "--replace"]
+    making.environment = ProcessInfo.processInfo.environment.merging(["PBS_MACKUP_HOME": home.folder.path]) { $1 }
+    making.standardOutput = FileHandle.nullDevice
+    making.standardError = FileHandle.nullDevice
+    try making.run()
+    defer { if making.isRunning { making.terminate() } }
+    let noted = home.folder.appendingPathComponent("key-folder")
+    for _ in 0..<200 where !there(noted) { usleep(50_000) }
+    let theirs = URL(fileURLWithPath: try String(contentsOf: noted, encoding: .utf8).trimmingCharacters(in: .newlines))
+    #expect(theirs.lastPathComponent.hasPrefix("key-") && there(theirs))
+
+    Scratch.removeLeftovers()
+    #expect(left.allSatisfy { !there($0) })                         // what nobody is using is gone, locked file and all;
+    #expect(there(mine.folder.appendingPathComponent("file")))      // what is in use stays, here
+    #expect(there(theirs))                                          // and in the other program,
+    try Data().write(to: home.folder.appendingPathComponent("go-on"))
+    making.waitUntilExit()
+    #expect(making.terminationStatus == 0)                          // which makes its key
+    #expect(try KeyStore.status().fingerprint == "aa:bb:cc")
+    #expect(!there(theirs))                                         // and removes its folder itself.
+    mine.remove()
+    #expect(!there(mine.folder))
+
+    // A run clears up as well, before it looks at anything else: this one stops at a
+    // configuration the app did not store.
+    let again = try leave()
+    try JSONEncoder().encode(home.config).write(to: Paths.config)
+    #expect(try home.runTool(["--manual"]).status == Runner.Exit.notConfigured.rawValue)
+    #expect(again.allSatisfy { !there($0) })
+    // What else lies there is not touched.
+    #expect(there(Paths.clientHome) && there(Paths.lock))
 }
 
 @Test func aClientIsStartedWithALimitOnItsOpenFiles() throws {
@@ -224,6 +360,9 @@ extension PrivateHomeTests {
     #expect(items[5].path == "Fotos été/a.jpg")
     // Nothing but the index is left in its folder, and a second asking reads it without the client.
     #expect(try FileManager.default.contentsOfDirectory(atPath: Paths.index.path) == [file.lastPathComponent])
+    // The folder is with what no other program is to read, and marked so that no backup takes it.
+    #expect(Paths.index.path.hasPrefix(Paths.guarded.path))
+    #expect(getxattr(Paths.index.path, SampleCheck.timeMachineExclusion, nil, 0, 0, XATTR_NOFOLLOW) >= 0)
     try FileManager.default.removeItem(at: home.folder.appendingPathComponent("client-calls"))
     #expect(try client.index(snapshot: snapshot, archives: ["Downloads.pxar", "me.pxar"]) == file)
     #expect(!FileManager.default.fileExists(atPath: home.folder.appendingPathComponent("client-calls").path))
@@ -246,4 +385,103 @@ extension PrivateHomeTests {
     try home.write("connection refused", to: "list-error")
     #expect(failure { _ = try client.versions(archive: "Downloads.pxar", path: "letters/a.txt") } == "connection refused")
 }
+
+@Test func aCommandAnswersOnlyTheCallersItsEntryNames() throws {
+    let home = try Home()
+    defer { home.remove() }
+    // The app gets what the Backups window and the settings ask for,
+    #expect(try home.runTool(["snapshots"], asTheApp).output == "[]\n")
+    #expect(try home.runTool(["setup-status"], asTheApp).status == 0)
+    // and nothing else: no run, no helper, nothing that is for a terminal or for root. Whoever
+    // connects to the helper of a build no developer signed gets no more than the app.
+    for who in [asTheApp, unchecked] {
+        for arguments in [[], ["--manual"], ["--full"], ["serve"], ["status"], ["check"], ["seal"],
+                          ["certificate", "127.0.0.1", "1"], ["restore-daemon"], ["restore-home", "me", "repository", "key.json"]] {
+            let refused = try home.runTool(arguments, who)
+            #expect(refused.status == 1 && refused.output.isEmpty, "\(arguments)")
+            #expect(refused.errors == "\(arguments.first ?? "A backup run") is started from a terminal or by launchd, not by the app.\n")
+        }
+    }
+    #expect(State.load().last == nil)                               // no run left a record
+    #expect(try home.runTool(["status"]).output == "no run yet\n")  // which a terminal may ask for
+
+    // What is for root says so to anyone else, with how it is used, and does nothing.
+    try #require(geteuid() != 0)
+    for name in ["restore-daemon", "restore-home"] {
+        let refused = try home.runTool([name, "me", "repository", "key.json"])
+        #expect(refused.status == 1)
+        #expect(refused.errors.hasPrefix("\(name) needs root.\nusage:\n  pbs-mackup-run \(name)"), "\(refused.errors)")
+    }
+}
+
+@Test func theOwnerConfirmsForEveryoneButTheAppMacOSHasChecked() throws {
+    let home = try Home()
+    defer { home.remove() }
+    let folder = home.folder.appendingPathComponent("bin").path
+    let key = Data(#"{"kdf":null,"created":"2026-01-02T03:04:05+01:00","data":"bm90IGEgcmVhbCBrZXk=","fingerprint":"aa:bb:cc"}"#.utf8)
+    let stored = home.folder.appendingPathComponent("secrets/encryption-key")
+
+    // Started as a program, and over the helper of a build no developer signed, where any
+    // program of the owner can be at the other end: nothing is read before the owner said yes.
+    for who in [[:], unchecked] {
+        let asked = who.merging(saysNo) { $1 }
+        #expect(try home.runTool(["snapshots"], asked).errors == "Not confirmed: list your backups\n")
+        #expect(try home.runTool(["list", snapshot, "Downloads.pxar"], asked).errors == "Not confirmed: read the names in your backups\n")
+        #expect(try home.runTool(["restore", snapshot, "Downloads.pxar", "a.txt", home.folder.path], asked).errors
+                == "Not confirmed: restore files from your backups\n")
+        #expect(!FileManager.default.fileExists(atPath: home.folder.appendingPathComponent("client-calls").path))   // no client was started
+        // Measuring reads the names in any folder the tool can read.
+        #expect(try home.runTool(["sizes", folder], asked).errors == "Not confirmed: read the names and sizes of what is in your folders\n")
+        #expect(FolderSizes.load(for: folder) == nil)
+        // What gives nothing away asks nothing.
+        #expect(try home.runTool(["setup-status"], asked).status == 0)
+        // And with a yes it is done.
+        #expect(try home.runTool(["snapshots"], who).output == "[]\n")
+        try FileManager.default.removeItem(at: home.folder.appendingPathComponent("client-calls"))
+    }
+
+    // The app is not asked,
+    let app = asTheApp.merging(saysNo) { $1 }
+    #expect(try home.runTool(["snapshots"], app).output == "[]\n")
+    #expect(try home.runTool(["sizes", folder], app).status == 0)
+    #expect(FolderSizes.load(for: folder) != nil)
+    // except before a key takes the place of another.
+    #expect(try home.runTool(["set-key"], app, input: key).errors == "Not confirmed: replace the encryption key of your backups\n")
+    #expect(try Data(contentsOf: stored) == Data("KEY".utf8))
+
+    // A first key from the app goes in without a question; from anyone else it is confirmed.
+    try FileManager.default.removeItem(at: stored)
+    for who in [[:], unchecked] {
+        #expect(try home.runTool(["set-key"], who.merging(saysNo) { $1 }, input: key).errors == "Not confirmed: set the encryption key of your backups\n")
+        #expect(!FileManager.default.fileExists(atPath: stored.path))
+    }
+    #expect(try home.runTool(["set-key"], app, input: key).output.contains(#""fingerprint":"aa:bb:cc""#))
+    #expect(try Data(contentsOf: stored) == key)
+
+    // The token the app stores after a restore of the home folder goes in without a question;
+    // from anyone else it is confirmed.
+    let token = home.folder.appendingPathComponent("secrets/token")
+    for who in [[:], unchecked] {
+        #expect(try home.runTool(["set-token"], who.merging(saysNo) { $1 }, input: Data("other".utf8)).errors
+                == "Not confirmed: replace the API token of your backups\n")
+    }
+    #expect(try home.runTool(["set-token"], app, input: Data("restored".utf8)).output == #"{"stored":"token"}"# + "\n")
+    #expect(try Data(contentsOf: token) == Data("restored".utf8))
+}
+}
+
+@Test func aProgramTheOwnerConfirmedIsKnownUntilItEnds() throws {
+    var callers = ConfirmedCallers()
+    #expect(!callers.holds(getpid()))
+    callers.note(getpid())
+    #expect(callers.holds(getpid()))
+    // Another program is asked about anew, and so is whatever gets the id of one that has ended.
+    let other = try Child(URL(fileURLWithPath: "/bin/sleep"), ["30"])
+    #expect(!callers.holds(other.pid))
+    callers.note(other.pid)
+    #expect(callers.holds(other.pid))
+    other.signal(SIGKILL)
+    other.wait()
+    #expect(!callers.holds(other.pid))
+    #expect(callers.holds(getpid()))
 }

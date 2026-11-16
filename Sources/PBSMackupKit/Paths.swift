@@ -36,13 +36,16 @@ public enum Paths {
     public static var lock: URL { cache.appendingPathComponent("run.lock") }
     /// A folder for what no other program is to read: the mounted APFS snapshot, which holds a
     /// copy of everything in the home folder, Mail and Messages included, the files a run
-    /// restores to check them, and a new key on its way into the Keychain. The cache is open
-    /// to every program of the user. An app signed by a developer has its group container
+    /// restores to check them, a new key on its way into the Keychain, and the lists of the
+    /// owner's file names that `index`, `sizes` and `changedFolders` are. The cache is open to
+    /// every program of the user. An app signed by a developer has its group container
     /// instead, where macOS asks the owner before it lets another developer's program in. A
     /// development build has no such folder and uses the cache.
     public static var guarded: URL { groupContainer ?? cache }
     /// Where a run mounts its APFS snapshot.
     public static var mount: URL { guarded.appendingPathComponent("mnt") }
+    /// The home folder the client is given in place of the owner's; see `Client.environment`.
+    public static var clientHome: URL { guarded.appendingPathComponent("client") }
     /// What the app and the run tool last stored themselves, see `Seal`. In the group
     /// container no other program can rewrite it; a development build keeps it with its
     /// other files, where it only guards against accidents.
@@ -54,20 +57,58 @@ public enum Paths {
         _ = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
         return home.appendingPathComponent("Library/Group Containers/\(group)")
     }
-    /// The names in the snapshots that were searched, one file each.
-    public static var index: URL { cache.appendingPathComponent("index") }
+    /// The names in the snapshots that were searched, one file each: every name in the home
+    /// folder, so it is in `guarded`, as are the three other files below that hold names. The
+    /// app reads this one and the sizes itself, from the same folder.
+    public static var index: URL { guarded.appendingPathComponent("index") }
     /// How big the backed-up folders are, one file each, from the last time they were measured.
-    public static var sizes: URL { cache.appendingPathComponent("sizes") }
-    /// Where a run leaves a file to see how far the change log has come; see `ChangeLog`.
+    public static var sizes: URL { guarded.appendingPathComponent("sizes") }
+    /// Where a run leaves a file to see how far the change log has come; see `ChangeLog`. In
+    /// the cache: the files are empty and their names say nothing.
     public static var changeMarker: URL { cache.appendingPathComponent("changes") }
-    /// The settings manifest a run uploads as `settings.conf`, while the run lasts.
-    public static var settingsManifest: URL { cache.appendingPathComponent("settings.json") }
+    /// The settings manifest a run uploads as `settings.conf`, while the run lasts. It names
+    /// the apps that open at login.
+    public static var settingsManifest: URL { guarded.appendingPathComponent("settings.json") }
     /// The folders that changed since the last backup, for the client, while a run lasts.
-    public static var changedFolders: URL { cache.appendingPathComponent("changed-folders") }
+    public static var changedFolders: URL { guarded.appendingPathComponent("changed-folders") }
     /// Files opened from a backup to look at; emptied when the Backups window closes and when
     /// the app quits or starts. In the cache, not in `guarded`: the program that opens such a
     /// file is another developer's.
     public static var preview: URL { cache.appendingPathComponent("preview") }
+
+    /// Makes `index` or `sizes`. In the cache no backup took them; the guarded folder is part
+    /// of the home folder, so they carry the mark that Time Machine and the client leave an
+    /// item out by, or each backup would take the names of the one before it.
+    static func createLeftOutOfBackups(_ folder: URL) throws {
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        var folder = folder, values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? folder.setResourceValues(values)
+    }
+
+    /// Versions up to 0.5.0 kept the index, the sizes, the changed folders and the settings
+    /// manifest in the cache, where every program of the user could read the names in them.
+    /// Removes what is left of them there. Nothing where the guarded folder is the cache.
+    public static func removeNamesFromCache() { removeNames(from: cache, nowIn: guarded) }
+
+    static func removeNames(from cache: URL, nowIn guarded: URL) {
+        guard guarded.path != cache.path else { return }
+        for item in [index, sizes, settingsManifest, changedFolders] {
+            try? FileManager.default.removeItem(at: cache.appendingPathComponent(item.lastPathComponent))
+        }
+    }
+
+    /// What Open Log opens for the log a run's record names. Any program of the user can
+    /// rewrite the state file, and what it names there, an app or a script, would be started
+    /// by that click. So only a log is opened: a file right in the logs folder, named as a run
+    /// names its log, and not a link that leads elsewhere. For anything else it is the folder.
+    public static func logToOpen(_ named: String?) -> URL {
+        guard let named else { return logs }
+        let file = URL(fileURLWithPath: named).resolvingSymlinksInPath()
+        guard file.deletingLastPathComponent().path == logs.resolvingSymlinksInPath().path, file.pathExtension == "log",
+              (try? file.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { return logs }
+        return file
+    }
 
     /// Not the mount point: mounting the snapshot makes it, and where that is refused only the
     /// mount fails.
@@ -81,25 +122,39 @@ public enum Paths {
 /// The app's bundle identifier, from which the other names are made: the run tool signs as
 /// that plus `.tool`, which is also the Keychain service, the client as `.client`, and the
 /// launchd jobs are `.scheduled`, `.manual` and `.helper`. The run tool sits
-/// inside the app, so both read the identifier from the bundle and the build script is the one
-/// place that names it. Outside a bundle (a development build, the tests) it is the identifier
-/// the build script uses when none is given.
+/// inside the app, so both read the identifier from the app's bundle and the build script is
+/// the one place that names it. Outside a bundle (a development build, the tests) it is the
+/// identifier the build script uses when none is given.
 public enum Identity {
-    public static let bundleID: String = {
-        if Bundle.main.bundleURL.pathExtension == "app", let identifier = Bundle.main.bundleIdentifier { return identifier }
-        return "me.0x23.pbs-mackup"
-    }()
+    /// The app that the program in `executable` belongs to: the bundle it is the program of,
+    /// or, for the run tool in a bundle of its own inside the app (see `Scripts/bundle.sh`),
+    /// the app around that bundle. Nil for a program that is in no bundle's `Contents/MacOS`.
+    /// `executable` is the file itself, not a link to it.
+    static func app(of executable: URL) -> URL? {
+        let programs = executable.deletingLastPathComponent(), contents = programs.deletingLastPathComponent()
+        var bundle = contents.deletingLastPathComponent()
+        guard programs.lastPathComponent == "MacOS", contents.lastPathComponent == "Contents", bundle.pathExtension == "app" else {
+            return nil
+        }
+        // A bundle in a folder of another app's `Contents` belongs to that app.
+        while true {
+            let contents = bundle.deletingLastPathComponent().deletingLastPathComponent()
+            let around = contents.deletingLastPathComponent()
+            guard contents.lastPathComponent == "Contents", around.pathExtension == "app" else { return bundle }
+            bundle = around
+        }
+    }
+
+    /// The app this program is part of. The app's `Contents/MacOS/pbs-mackup-run` can be a
+    /// link to the run tool in its own bundle, so the link is followed first.
+    public static let app: URL? = Bundle.main.executableURL.flatMap { app(of: $0.resolvingSymlinksInPath()) }
+
+    public static let bundleID: String = app.flatMap { Bundle(url: $0)?.bundleIdentifier } ?? "me.0x23.pbs-mackup"
 
     /// What the run tool is signed as.
     public static var toolIdentifier: String { bundleID + ".tool" }
     /// The launchd job that makes the scheduled backups.
     public static var scheduledLabel: String { bundleID + ".scheduled" }
-    /// What that job was called before 0.2. launchd remembers under a job's name which program
-    /// it may start, by the name the program was signed as when the job was first registered,
-    /// and it keeps to that when the job is registered again. The run tool signs under another
-    /// name since 0.2 (see `Keychain`), so launchd refuses to start it for the old job. The
-    /// same holds for the jobs of today should the run tool ever be renamed again.
-    public static var legacyLabel: String { bundleID + ".run" }
     /// The launchd job for a backup the owner asked for. It is not a background job, so such a
     /// backup gets the fast cores and unthrottled disk and network.
     public static var manualLabel: String { bundleID + ".manual" }

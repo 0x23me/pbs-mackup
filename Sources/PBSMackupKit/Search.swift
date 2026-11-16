@@ -120,14 +120,14 @@ extension Client {
         return Paths.index.appendingPathComponent(name + ".json")
     }
 
-    /// Writes the names of everything in these archives of a snapshot into the cache, unless
+    /// Writes the names of everything in these archives of a snapshot into `Paths.index`, unless
     /// that was done before, and returns the file. Only names, sizes and dates are fetched.
     /// A home folder has a few million of them, so they go from the client to the file line
     /// by line and are never all in memory here.
     public func index(snapshot: String, archives: [String]) throws -> URL {
         try Client.check(snapshot: snapshot, archives: archives)
         let manager = FileManager.default
-        try manager.createDirectory(at: Paths.index, withIntermediateDirectories: true)
+        try Paths.createLeftOutOfBackups(Paths.index)
         // An index stays valid, but there is one per snapshot: those not used for two weeks go.
         for old in (try? manager.contentsOfDirectory(at: Paths.index, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
             if let used = try? old.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate,

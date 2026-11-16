@@ -28,10 +28,12 @@ public final class Child {
     /// empty when nothing is given for it. With `sendingInput: false` nothing is written until
     /// `sendInput` is called, and a program that reads its input waits for that. With
     /// `terminal` the standard input is a terminal that nobody types into, for a program that
-    /// wants one before it reads what it is given on another descriptor.
+    /// wants one before it reads what it is given on another descriptor. With `suspended` the
+    /// program is there but does not run, not one instruction of it, until `resume` is called:
+    /// for a program that is to be looked at before it does anything.
     public init(_ executable: URL, _ arguments: [String], environment: [String: String]? = nil,
                 input: [Int32: Data] = [:], mergingErrors: Bool = false, sendingInput: Bool = true,
-                terminal: Bool = false) throws {
+                terminal: Bool = false, suspended: Bool = false) throws {
         precondition(input.keys.allSatisfy { $0 == 0 || $0 > 2 }, "1 and 2 are the program's output")
         precondition(!terminal || input[0] == nil, "the terminal is the standard input")
         var actions: posix_spawn_file_actions_t?
@@ -96,8 +98,11 @@ public final class Child {
         posix_spawnattr_setsigdefault(&attributes, &all)
         posix_spawnattr_setsigmask(&attributes, &none)
         posix_spawnattr_setpgroup(&attributes, 0)
+        // A program that starts suspended does not stay behind when this one ends before it
+        // lets it run: a stopped process group whose parent is gone is sent the hang-up signal
+        // by macOS, which ends the program.
         posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF | POSIX_SPAWN_SETSIGMASK
-                                                    | POSIX_SPAWN_SETPGROUP))
+                                                    | POSIX_SPAWN_SETPGROUP | (suspended ? POSIX_SPAWN_START_SUSPENDED : 0)))
 
         // The bytes of the strings as they are: no form of writing an accent is turned into another.
         let argv: [UnsafeMutablePointer<CChar>?] = ([executable.path] + arguments).map { strdup($0) } + [nil]
@@ -183,6 +188,37 @@ public final class Child {
     public func signal(_ number: Int32) {
         lock.lock(); defer { lock.unlock() }
         if ended(wait: WNOHANG) == nil { kill(pid, number) }
+    }
+
+    /// Lets a program run that was started with `suspended`, and waits until it does: until it
+    /// has run some of its own code, or has ended. False when it still has not after `seconds`,
+    /// not counting time the Mac sleeps. That has happened, once in many starts: the program
+    /// was let run and never began, at its first instruction for minutes, and another SIGCONT
+    /// did not change that. Such a program has done nothing, and can be ended and started again.
+    @discardableResult
+    public func resume(within seconds: Double = 10) -> Bool {
+        let deadline = DispatchTime.now() + seconds
+        var tick = 0
+        while true {
+            // Again every tenth of a second, for a SIGCONT that went missing: harmless to one that runs.
+            if tick % 100 == 0 { signal(SIGCONT) }
+            if hasRun { return true }
+            if DispatchTime.now() >= deadline { return false }
+            usleep(1_000)
+            tick += 1
+        }
+    }
+
+    /// Whether the program has run some of its own code, or has ended. One started `suspended`
+    /// has not, until it is let run: until then it has spent no time at all outside the system.
+    public var hasRun: Bool {
+        lock.lock(); defer { lock.unlock() }
+        if ended(wait: WNOHANG) != nil { return true }
+        var usage = rusage_info_v2()
+        let found = withUnsafeMutablePointer(to: &usage) {
+            $0.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { proc_pid_rusage(pid, RUSAGE_INFO_V2, $0) }
+        }
+        return found == 0 && usage.ri_user_time > 0
     }
 
     /// Asks the program to stop, as Control-C does.

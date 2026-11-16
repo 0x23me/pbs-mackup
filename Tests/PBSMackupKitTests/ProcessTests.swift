@@ -56,6 +56,57 @@ private func text(_ data: Data) -> String { String(decoding: data, as: UTF8.self
     #expect(result.status == 0 && result.output.isEmpty)        // or nothing at all
 }
 
+@Test func aChildStartedSuspendedDoesNothingUntilItIsLetRun() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("pbs-mackup-suspended-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let mark = folder.appendingPathComponent("ran")
+    func started() throws -> Child { try Child(shell, ["-c", #"echo ran > "$0""#, mark.path], suspended: true) }
+
+    let held = try started()
+    usleep(200_000)
+    #expect(held.isRunning && !FileManager.default.fileExists(atPath: mark.path))      // it is there, and has done nothing,
+    #expect(!held.hasRun)
+    #expect(held.resume())
+    #expect(held.finish().status == 0)
+    #expect(FileManager.default.fileExists(atPath: mark.path))                         // until it is let run.
+
+    // One that is never let run ends without having done anything.
+    try FileManager.default.removeItem(at: mark)
+    let refused = try started()
+    refused.signal(SIGKILL)
+    #expect(refused.wait() == SIGKILL)
+    #expect(!FileManager.default.fileExists(atPath: mark.path))
+}
+
+@Test func everyChildStartedSuspendedRunsWhenItIsLetRun() throws {
+    // Once in many starts one was let run and never began, and whoever read its output waited
+    // for ever. Now `resume` says so, after a while, instead. Many at once, as the tests run.
+    let failed = NSLock(), group = DispatchGroup()
+    var problems: [String] = []
+    for _ in 0..<4 {
+        group.enter()
+        Thread {
+            defer { group.leave() }
+            for _ in 0..<100 {
+                do {
+                    let child = try Child(shell, ["-c", "echo ran"], suspended: true)
+                    let began = child.resume(within: 5)
+                    if !began { child.signal(SIGKILL) }
+                    let result = child.finish()
+                    if !began || result.status != 0 || text(result.output) != "ran\n" {
+                        failed.lock(); problems.append("began \(began), status \(result.status)"); failed.unlock()
+                    }
+                } catch {
+                    failed.lock(); problems.append("\(error)"); failed.unlock()
+                }
+            }
+        }.start()
+    }
+    group.wait()
+    #expect(problems.isEmpty)
+}
+
 @Test func aChildOfAParentThatIgnoresASignalStillEndsOnIt() throws {
     // As the run tool does with the signals it turns into a cancelled run: it ignores them
     // itself. A child that inherited that could not be stopped with them. Blocked signals are

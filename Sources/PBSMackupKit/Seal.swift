@@ -52,16 +52,10 @@ public struct Seal: Codable, Equatable {
         try seal.save()
     }
 
-    /// Notes the configuration and the key that are there as the ones to go by, each where the
-    /// seal has none yet: after an update from a version that kept no seal, and on a first
-    /// start after the app's own folder was removed. Only ever asked for by the app or, with
-    /// the owner's confirmation, at a terminal. A key is not taken over while the key of a
-    /// version before 0.2 still waits to be moved: that one is the key that counts.
-    public static func adopt() throws {
-        let seal = load()
-        if seal.config == nil, let config = try? Config.load() { try set(config: config) }
-        if seal.key == nil, !Keychain.hasLegacy(.encryptionKey), let key = try Keychain.get(.encryptionKey) { try set(key: key) }
-    }
+    // Nothing notes a configuration or a key just because it is there and the seal has none:
+    // whoever can remove the seal, or gets in before there is one, would have theirs taken
+    // over. Without a seal the owner says which ones count: Done in the settings window or
+    // `pbs-mackup-run seal` for the configuration, importing the recovery copy for the key.
 
     public static func holds(_ config: Config) -> Bool { load().config == digest(of: config) }
 

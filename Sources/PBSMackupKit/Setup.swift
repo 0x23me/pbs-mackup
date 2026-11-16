@@ -60,30 +60,30 @@ public enum KeyStore {
     /// the owner can enter and that is removed when `body` returns. The client wants a path to
     /// write the key to; it makes the file readable by the owner only. The folder is where
     /// other programs of the owner are kept out as well (`Paths.guarded`), as far as this
-    /// build has such a place.
+    /// build has such a place. A command that is killed leaves the folder behind; the next
+    /// run and the helper remove it then, see `Scratch`.
     private static func withScratchFile<T>(_ body: (URL) throws -> T) throws -> T {
         try Paths.createFolders()
-        try FileManager.default.createDirectory(at: Paths.guarded, withIntermediateDirectories: true)
-        let folder = Paths.guarded.appendingPathComponent("key-\(UUID().uuidString)")
-        guard mkdir(folder.path, 0o700) == 0 else {
-            throw Failure(description: "No folder for the new key in \(Paths.guarded.path): \(String(cString: strerror(errno))).")
-        }
-        defer { try? FileManager.default.removeItem(at: folder) }
-        return try body(folder.appendingPathComponent("key"))
+        let scratch = try Scratch(.key)
+        defer { scratch.remove() }
+        return try body(scratch.folder.appendingPathComponent("key"))
     }
 
     /// Creates a key without a passphrase of its own; the Keychain protects it. Refuses when a
     /// key exists, unless `replacing`: earlier backups can then only be read with the old key's
     /// recovery copy. Errors never quote the client's output, which could hold key material.
     /// The client that makes the key knows it, so a release build takes only its own
-    /// developer's client for this too.
+    /// developer's client for this too, and looks at what runs before it lets it run, as
+    /// with every client (`Client.launch`).
     public static func create(client: URL, replacing: Bool = false) throws -> Status {
+        try create(client: client, replacing: replacing, signedAs: Client.requirement())
+    }
+
+    static func create(client: URL, replacing: Bool = false, signedAs requirement: SecRequirement?) throws -> Status {
         guard try replacing || !status().present else { throw Failure(description: "There is an encryption key already.") }
-        if let requirement = try Client.requirement(), !Signature.isSigned(client, as: requirement) {
-            throw Failure(description: "\(client.path) is not signed the way this app's developer signs its client, so it made no key. Install the app again.")
-        }
         try withScratchFile { file in
-            let made = tool(client.path, ["key", "create", file.path, "--kdf", "none"], environment: Client.environment())
+            let made = try Client.launch(client, ["key", "create", file.path, "--kdf", "none"], mergingErrors: true,
+                                         signedAs: requirement).finish()
             guard made.status == 0, let key = try? Data(contentsOf: file) else {
                 throw Failure(description: "The client could not create a key (exit status \(made.status)).")
             }
@@ -115,18 +115,18 @@ public enum KeyStore {
     /// enter (`withScratchFile`) and are gone when this returns. The passphrase goes to the
     /// client on a descriptor of its own, never in its arguments or its environment, and only
     /// once the started client has shown it is the one the app's developer signed, as with
-    /// `Client.start`. Errors never quote the client's output.
+    /// every client (`Client.launch`). Errors never quote the client's output.
     public static func importKey(_ data: Data, passphrase: String, client: URL) throws -> Status {
+        try importKey(data, passphrase: passphrase, client: client, signedAs: Client.requirement())
+    }
+
+    static func importKey(_ data: Data, passphrase: String, client: URL, signedAs requirement: SecRequirement?) throws -> Status {
         let (data, file) = try keyFile(data)
         guard file.kdf != nil else { return try importKey(data) }
         // The client reads the first line of the descriptor and takes nothing shorter than five bytes.
         guard !passphrase.contains(where: \.isNewline) else { throw Failure(description: "A passphrase is one line.") }
         let wrong = "The passphrase is wrong." + (file.hint.map { " The key file's hint: \($0)" } ?? "")
         guard passphrase.utf8.count >= 5 else { throw Failure(description: wrong) }
-        let requirement = try Client.requirement()
-        if let requirement, !Signature.isSigned(client, as: requirement) {
-            throw Failure(description: "\(client.path) is not signed the way this app's developer signs its client, so it unlocked no key. Install the app again.")
-        }
         let unlocked: Data = try withScratchFile { path in
             let descriptor = open(path.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
             guard descriptor >= 0 else { throw Failure(description: "The key file could not be passed on: \(String(cString: strerror(errno))).") }
@@ -136,19 +136,9 @@ public enum KeyStore {
 
             // `key change-passphrase` wants a terminal on its standard input, even when it is
             // told where else to read the old passphrase; with `--kdf none` it asks for no new one.
-            var environment = Client.environment()
-            environment["PBS_ENCRYPTION_PASSWORD_FD"] = "3"
-            let child = try Child(client, ["key", "change-passphrase", path.path, "--kdf", "none"], environment: environment,
-                                  input: [3: Data((passphrase + "\n").utf8)], mergingErrors: true, sendingInput: false, terminal: true)
-            if let requirement {
-                guard let running = Signature.running(child.pid), Signature.isSigned(running, as: requirement) else {
-                    child.closeInput()
-                    child.signal(SIGKILL)
-                    child.wait()
-                    throw Failure(description: "The client that started is not signed the way this app's developer signs its client. It was stopped before it got the passphrase.")
-                }
-            }
-            child.sendInput()
+            let child = try Client.launch(client, ["key", "change-passphrase", path.path, "--kdf", "none"],
+                                          adding: ["PBS_ENCRYPTION_PASSWORD_FD": "3"], input: [3: Data((passphrase + "\n").utf8)],
+                                          mergingErrors: true, terminal: true, signedAs: requirement)
             // Should it ever wait for the terminal after all, nobody would type there.
             DispatchQueue.global().asyncAfter(deadline: .now() + 120) { child.signal(SIGKILL) }
             let result = child.finish()

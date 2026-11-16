@@ -42,6 +42,21 @@ private let stub = #"""
         return found;
     }
 
+    /* The first name, byte by byte, that the folder has for this file. */
+    static void first_name(const char *folder, const struct stat *file, char *first, size_t size) {
+        DIR *entries = opendir(folder);
+        struct dirent *entry;
+        struct stat info;
+        char path[4096];
+        *first = 0;
+        while (entries && (entry = readdir(entries))) {
+            snprintf(path, sizeof path, "%s/%s", folder, entry->d_name);
+            if (lstat(path, &info) == 0 && info.st_dev == file->st_dev && info.st_ino == file->st_ino
+                && (!*first || strcmp(entry->d_name, first) < 0)) snprintf(first, size, "%s", entry->d_name);
+        }
+        if (entries) closedir(entries);
+    }
+
     int main(int argc, char **argv) {
         const char *home = getenv("PBS_MACKUP_HOME"), *mode = getenv("PBS_MACKUP_STUB");
         char path[4096], buffer[4096];
@@ -68,7 +83,28 @@ private let stub = #"""
             char folder[4096];
             snprintf(folder, sizeof folder, "%s", path);
             *strrchr(folder, '/') = 0;
-            if (!holds(folder, basename(item)) || stat(path, &info) != 0 || copyfile(path, restored, NULL, COPYFILE_ALL) != 0) {
+            if (!holds(folder, basename(item)) || stat(path, &info) != 0) {
+                fprintf(stderr, "Error: no such path in %s: %s\n", argv[4], item);
+                return 255;
+            }
+            /* A file with several names is stored under the first of its folder; each later name
+               is a link to that path below the target, which only works when it was restored there. */
+            char first[1024], linked[4096], dir[4096];
+            first_name(folder, &info, first, sizeof first);
+            if (info.st_nlink > 1 && strcmp(first, basename(item))) {
+                snprintf(dir, sizeof dir, "%s", item);
+                char *slash = strrchr(dir, '/');
+                if (slash) *slash = 0; else *dir = 0;
+                snprintf(linked, sizeof linked, "%s/%s%s%s", argv[6], dir, *dir ? "/" : "", first);
+                if (link(linked, restored) == 0) return 0;
+                snprintf(linked, sizeof linked, "%s/%s", argv[6], dir);
+                if (*dir && stat(linked, &info) != 0)
+                    fprintf(stderr, "Error: error extracting %s - failed to open hardlink target directory \"%s\": ENOENT: No such file or directory\n", item, dir);
+                else
+                    fprintf(stderr, "Error: error extracting %s - ENOENT: No such file or directory\n", item);
+                return 255;
+            }
+            if (copyfile(path, restored, NULL, COPYFILE_ALL) != 0) {
                 fprintf(stderr, "Error: no such path in %s: %s\n", argv[4], item);
                 return 255;
             }
@@ -216,7 +252,7 @@ private func localSnapshots() -> Set<String> {
 /// they run one after another.
 @Suite(.serialized)
 struct PrivateHomeTests {
-@Test func aMeasurementIsKeptInTheCacheForItsFolder() throws {
+@Test func aMeasurementIsKeptForItsFolder() throws {
     let home = FileManager.default.temporaryDirectory.appendingPathComponent("pbs-mackup-sizes-\(UUID().uuidString)")
     setenv("PBS_MACKUP_HOME", home.path, 1)
     defer { unsetenv("PBS_MACKUP_HOME"); try? FileManager.default.removeItem(at: home) }
@@ -226,7 +262,9 @@ struct PrivateHomeTests {
     #expect(FolderSizes.load(for: folder) == nil)
     let sizes = try FolderSizes.measure(folder, smallest: 0)
     let file = try sizes.save()
-    #expect(file.path.hasPrefix(Paths.sizes.path))
+    #expect(file.path.hasPrefix(Paths.sizes.path) && Paths.sizes.path.hasPrefix(Paths.guarded.path))
+    // Its folder is in the home folder in a signed build, and no backup is to take it.
+    #expect(getxattr(Paths.sizes.path, SampleCheck.timeMachineExclusion, nil, 0, 0, XATTR_NOFOLLOW) >= 0)
     #expect(FolderSizes.load(for: folder)?.root == sizes.root)
     #expect(try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? Int == 0o600)
 }
@@ -276,6 +314,57 @@ struct PrivateHomeTests {
     #expect(try restore(.replace) == "a.txt")
     #expect(contents("a.txt") == "hello a.txt")
     #expect(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted() == ["a 2.txt", "a.txt"])   // no staging folder left
+}
+
+@Test func aSampledLaterNameOfAHardLinkIsRestoredWithTheNameItLinksTo() throws {
+    let fixture = try Fixture()                     // its stand-in stores a later name as a link, as the client does
+    let source = fixture.home.appendingPathComponent("Source")
+    let folder = source.appendingPathComponent("RestoreTest")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let first = folder.appendingPathComponent("hardlink-a.txt"), later = folder.appendingPathComponent("hardlink-b.txt")
+    try Data("one file, two names".utf8).write(to: first)
+    try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_600_000_000)], ofItemAtPath: first.path)
+    #expect(link(first.path, later.path) == 0)
+    let client = try Client(config: Config.load())
+    let snapshot = "host/test-mac/2026-01-02T03:04:05Z"
+    var asked: [String] = []
+    func extract(_ item: String, _ into: URL) throws {
+        asked.append(item)
+        _ = try client.capture(["catalog", "extract", snapshot, "Source.pxar", Client.pathArgument(item), into.path])
+    }
+
+    // Alone, the later name cannot be restored: the name it links to is not there.
+    let alone = fixture.home.appendingPathComponent("alone")
+    #expect {
+        try extract("RestoreTest/hardlink-b.txt", alone)
+    } throws: { SampleCheck.hardLinkFolder(in: "\($0)") == "RestoreTest" }
+
+    // The check restores the first name too, and compares the real content.
+    asked = []
+    let target = fixture.home.appendingPathComponent("check")
+    try SampleCheck.restore("RestoreTest/hardlink-b.txt", in: source, into: target, extract: extract)
+    #expect(asked == ["RestoreTest/hardlink-b.txt", "RestoreTest/hardlink-a.txt", "RestoreTest/hardlink-b.txt"])
+    #expect(SampleCheck.differences(original: later, restored: target.appendingPathComponent("hardlink-b.txt")) == [])
+
+    // The first name on its own needs nothing else.
+    asked = []
+    try SampleCheck.restore("RestoreTest/hardlink-a.txt", in: source, into: fixture.home.appendingPathComponent("check-a"), extract: extract)
+    #expect(asked == ["RestoreTest/hardlink-a.txt"])
+
+    // A link whose first name the snapshot lacks still cannot be restored, and says why.
+    func losing(_ item: String, _ into: URL) throws {
+        if item == "RestoreTest/hardlink-a.txt" { throw Client.Failure(description: "no such path in Source.pxar: \(item)") }
+        try extract(item, into)
+    }
+    #expect {
+        try SampleCheck.restore("RestoreTest/hardlink-b.txt", in: source, into: fixture.home.appendingPathComponent("lost"), extract: losing)
+    } throws: { "\($0)".contains("failed to open hardlink target directory \"RestoreTest\"") }
+}
+
+@Test func theFolderAHardLinkPointsIntoIsReadAsRustWritesIt() {
+    let message = #"error extracting x - failed to open hardlink target directory "Bu\u{308}cher/\"a\"\\b\'c/\xc3\xbc": ENOENT"#
+    #expect(SampleCheck.hardLinkFolder(in: message) == "Bu\u{308}cher/\"a\"\\b'c/\u{FC}")
+    #expect(SampleCheck.hardLinkFolder(in: "error extracting x - ENOENT: No such file or directory") == nil)
 }
 
 @Test func aRunningClientShowsItsSecretsToNoOtherProgram() throws {

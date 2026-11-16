@@ -9,16 +9,100 @@ private func membershipUUID(ofUID uid: uid_t, _ uuid: UnsafeMutablePointer<UInt8
 private func membershipID(ofUUID uuid: UnsafePointer<UInt8>, _ id: UnsafeMutablePointer<id_t>, _ kind: UnsafeMutablePointer<Int32>) -> Int32
 
 /// Puts a whole home folder back on a Mac that was set up anew: what `pbs-mackup-run
-/// restore-home` does. Root does it, from the account of another administrator, while the
-/// user whose folder it is is not logged in. The folder is restored next to the user's new
-/// one, so that owners, permissions, ACLs and flags come back as they were, and only once it
-/// is complete do the two change places. The new one is kept, under another name.
+/// restore-home` does, from the account of another administrator, and what the restore daemon
+/// does for the app (`RestoreService`), while the user whose folder it is stays logged in.
+/// Root does it. The folder is restored on the volume of the user's new one, so that owners,
+/// permissions, ACLs and flags come back as they were, and only once it is complete do the two
+/// change places. The new one is kept, under another name.
+///
+/// The restored folder belongs to the user from its first file on, and root still has work to
+/// do in it. So it is restored inside a folder that only root can enter (`Places.staging`) and
+/// comes out of there only at the swap; and what root does in it goes by descriptors and never
+/// by a path (`Tree`), which holds whoever owns the folders on the way.
 public enum HomeRestore {
     /// A user of this Mac, as the restore needs it.
     public struct Account {
         public let name: String
         public let uid: uid_t
         public let home: URL
+    }
+
+    /// Where a restore of the home folder `home` works.
+    public struct Places: Equatable, Sendable {
+        public let home: URL
+        /// A folder next to `home` that belongs to root and that nobody else can enter. Next
+        /// to it, so that it is on the same volume and the swap stays a rename.
+        public let staging: URL
+        /// The restored folder, in `staging` until it takes the place of `home`.
+        public let restored: URL
+        /// Where the folder that was at `home` is kept after the swap, for its owner to look
+        /// into until they have it deleted.
+        public let aside: URL
+
+        public init(home: URL) {
+            let home = home.standardizedFileURL
+            self.home = home
+            staging = home.deletingLastPathComponent().appendingPathComponent(".pbs-mackup-restore-\(home.lastPathComponent)")
+            restored = staging.appendingPathComponent(home.lastPathComponent)
+            aside = URL(fileURLWithPath: home.path + ".before-restore")
+        }
+    }
+
+    /// What has to hold before anything is restored: no restore that did not finish is in the
+    /// way, and the disk has room for the snapshot.
+    public static func preflight(_ places: Places, size: Int64?) throws {
+        if exists(places.staging) { try checkStaging(places.staging) }
+        guard !exists(places.restored) else {
+            throw Failure(description: "\(places.restored.path) is there already, from an earlier restore that did not finish. "
+                + "Remove \(places.staging.path) first, as root.")
+        }
+        guard !exists(places.aside) else {
+            throw Failure(description: "\(places.aside.path) is there already, from an earlier restore. Move it out of the way first.")
+        }
+        if let size, let free = freeBytes(at: places.home.deletingLastPathComponent()), free < size + size / 10 {
+            throw Failure(description: "The snapshot takes \(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)), "
+                + "and the disk has \(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) free.")
+        }
+    }
+
+    /// Makes the folder a restore works in, or takes the one an earlier restore left when it
+    /// is as this would make it.
+    static func makeStaging(_ folder: URL) throws {
+        let made = mkdir(folder.path, 0o700) == 0
+        guard made || errno == EEXIST else {
+            throw Failure(description: "\(folder.path) could not be made: \(String(cString: strerror(errno))).")
+        }
+        try checkStaging(folder, made: made)
+    }
+
+    /// Throws unless `folder` is a folder of whoever runs this, which is root, that nobody else
+    /// can enter: mode 700 and no ACL. One that was just `made` has that seen to; one that was
+    /// there is only looked at, and not trusted when someone made it otherwise.
+    static func checkStaging(_ folder: URL, made: Bool = false) throws {
+        let refused = Failure(description: "\(folder.path) is not a folder that only \(geteuid() == 0 ? "root" : "its owner") can open. "
+            + "Remove it, then restore again.")
+        guard let fd = Tree.open(folder.path) else { throw refused }
+        defer { close(fd) }
+        if made {
+            // What the folder above hands down, and what the umask took away.
+            if let none = acl_init(0) {
+                acl_set_fd_np(fd, none, ACL_TYPE_EXTENDED)
+                acl_free(UnsafeMutableRawPointer(none))
+            }
+            fchmod(fd, 0o700)
+        }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_uid == geteuid(), info.st_mode & 0o7777 == 0o700 else { throw refused }
+        var named = false
+        forEachQualifier(fd) { _, _ in named = true; return true }
+        if named { throw refused }
+    }
+
+    /// Removes what a restore that does not go on left: the restored folder and the folder it
+    /// is in. A folder that is not root's alone is not this program's and stays.
+    public static func discard(_ places: Places) {
+        guard (try? checkStaging(places.staging)) != nil else { return }
+        removeRestored(places.staging)
     }
 
     public static func account(_ name: String) throws -> Account {
@@ -85,28 +169,39 @@ public enum HomeRestore {
         return Int64(info.f_bavail) * Int64(info.f_bsize)
     }
 
-    /// Restores `archive` of `snapshot` into `folder`, which must not exist yet, handing what the
-    /// client says to `output` as it comes. A restore that fails leaves nothing behind.
-    public static func restore(_ client: Client, snapshot: String, archive: String, into folder: URL,
+    /// Restores `archive` of `snapshot` as `places.restored`, which must not exist yet, handing
+    /// what the client says to `output` as it comes. A restore that fails leaves nothing behind.
+    public static func restore(_ client: Client, snapshot: String, archive: String, into places: Places,
                                output: (Data) -> Void) throws {
         try Client.check(snapshot: snapshot, archives: [archive])
+        let folder = places.restored
+        try makeStaging(places.staging)
         guard !exists(folder) else { throw Failure(description: "\(folder.path) is there already, from an earlier try. Remove it first.") }
-        let result = try client.start(["restore", snapshot, archive, folder.path], mergingErrors: true).finish(output: output)
-        guard result.status == 0 else {
-            removeRestored(folder)
-            throw Failure(description: "The client could not restore \(archive) (exit status \(result.status)); nothing was changed.")
+        do {
+            let result = try client.start(["restore", snapshot, archive, folder.path], mergingErrors: true).finish(output: output)
+            guard result.status == 0 else {
+                throw Failure(description: "The client could not restore \(archive) (exit status \(result.status)); nothing was changed.")
+            }
+            guard exists(folder) else { throw Failure(description: "The client restored nothing into \(folder.path).") }
+        } catch {
+            discard(places)
+            throw error
         }
-        guard exists(folder) else { throw Failure(description: "The client restored nothing into \(folder.path).") }
     }
 
     /// Hands what belongs to `old` below `root` to `new`, for a user whose number on this Mac is
     /// not the one it had. Returns how many items changed and the ones that could not.
     public static func reown(_ root: URL, from old: uid_t, to new: uid_t) -> (changed: Int, failed: [String]) {
         var changed = 0, failed: [String] = []
-        walk(root) { path, info in
-            guard info.st_uid == old else { return }
-            let done = unlocked(path, info) { lchown(path, new, gid_t(bitPattern: -1)) == 0 }
-            if done { changed += 1 } else { failed.append(path) }
+        let group = gid_t(bitPattern: -1)
+        Tree.walk(root) { item in
+            guard item.info.st_uid == old else { return }
+            // By its descriptor the item is the one that was just seen to belong to `old`. A
+            // socket, a pipe or a device has none and goes by its name in the open folder.
+            let done = item.isSpecial
+                ? fchownat(item.parent, item.name, new, group, AT_SYMLINK_NOFOLLOW) == 0
+                : item.withDescriptor { fd in unlocked(fd, item.info) { fchown(fd, new, group) == 0 } } ?? false
+            if done { changed += 1 } else { failed.append(item.path) }
         }
         return (changed, failed)
     }
@@ -117,10 +212,12 @@ public enum HomeRestore {
     /// ACLs name only the group everyone, which every Mac knows; `Public/Drop Box` names its owner.
     public static func strangers(in root: URL) -> Set<UUID> {
         var found: Set<UUID> = []
-        walk(root) { path, _ in
-            forEachQualifier(path) { id, _ in
-                if !isKnown(id) { found.insert(id) }
-                return false
+        Tree.walk(root) { item in
+            item.withDescriptor { fd in
+                forEachQualifier(fd) { id, _ in
+                    if !isKnown(id) { found.insert(id) }
+                    return false
+                }
             }
         }
         return found
@@ -129,20 +226,22 @@ public enum HomeRestore {
     /// Puts `new` in the place of `old` in every ACL below `root`.
     public static func replaceInACLs(_ root: URL, _ old: UUID, with new: UUID) -> (changed: Int, failed: [String]) {
         var changed = 0, failed: [String] = []
-        walk(root) { path, info in
-            guard let acl = acl_get_link_np(path, ACL_TYPE_EXTENDED) else { return }
-            defer { acl_free(UnsafeMutableRawPointer(acl)) }
-            var touched = false
-            forEachEntry(acl) { entry in
-                guard let qualifier = acl_get_qualifier(entry) else { return }
-                defer { acl_free(qualifier) }
-                let guid = qualifier.assumingMemoryBound(to: guid_t.self)
-                guard UUID(uuid: guid.pointee.g_guid) == old else { return }
-                var replacement = guid_t(g_guid: new.uuid)
-                if acl_set_qualifier(entry, &replacement) == 0 { touched = true }
+        Tree.walk(root) { item in
+            item.withDescriptor { fd in
+                guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else { return }
+                defer { acl_free(UnsafeMutableRawPointer(acl)) }
+                var touched = false
+                forEachEntry(acl) { entry in
+                    guard let qualifier = acl_get_qualifier(entry) else { return }
+                    defer { acl_free(qualifier) }
+                    let guid = qualifier.assumingMemoryBound(to: guid_t.self)
+                    guard UUID(uuid: guid.pointee.g_guid) == old else { return }
+                    var replacement = guid_t(g_guid: new.uuid)
+                    if acl_set_qualifier(entry, &replacement) == 0 { touched = true }
+                }
+                guard touched else { return }
+                if unlocked(fd, item.info, { acl_set_fd_np(fd, acl, ACL_TYPE_EXTENDED) == 0 }) { changed += 1 } else { failed.append(item.path) }
             }
-            guard touched else { return }
-            if unlocked(path, info, { acl_set_link_np(path, ACL_TYPE_EXTENDED, acl) == 0 }) { changed += 1 } else { failed.append(path) }
         }
         return (changed, failed)
     }
@@ -182,10 +281,49 @@ public enum HomeRestore {
         } else if strangers.count > 1 {
             notes.append("ACLs name \(strangers.count) users or groups this Mac does not know; they were left as they are.")
         }
-        let cloud = cloudFolders.map { restored.appendingPathComponent($0) }.filter(exists)
-        cloud.forEach(removeRestored)
-        if !cloud.isEmpty { notes.append("iCloud Drive and other cloud storage were left out. They sync again once you sign in.") }
+        if removeCloudFolders(from: restored) {
+            notes.append("iCloud Drive and other cloud storage were left out. They sync again once you sign in.")
+        }
         return notes
+    }
+
+    /// Removes `cloudFolders` from a restored home folder; returns whether any was there. Each
+    /// is reached from the folder itself, name by name and never through a link: a backup can
+    /// hold a link where `Library` should be, and what that points to is not the restore's.
+    static func removeCloudFolders(from restored: URL) -> Bool {
+        guard let root = Tree.open(restored.path) else { return false }
+        defer { close(root) }
+        var found = false
+        for folder in cloudFolders {
+            let names = folder.split(separator: "/").map(String.init)
+            guard let name = names.last, let parent = Tree.open(Array(names.dropLast()), below: root) else { continue }
+            defer { close(parent) }
+            var info = stat(), left = Leftovers()
+            guard fstatat(parent, name, &info, AT_SYMLINK_NOFOLLOW) == 0 else { continue }
+            Tree.remove(name, in: parent, at: folder, left: &left)
+            found = true
+        }
+        return found
+    }
+
+    /// Deletes what is in the home folder that a restore set aside, for the app at Finish. It
+    /// is the work of the folder's owner and done as them, not by the restore daemon: the
+    /// owner can reach that folder all the while, and root deleting in a folder that someone
+    /// else can change is how root gets sent to files that are not theirs. What the owner
+    /// cannot delete stays and is returned. So does the emptied folder itself: it lies in
+    /// /Users, where only root removes it, which the daemon does when it is told to finish.
+    public static func emptyAside(of state: RestoreState) -> Leftovers {
+        guard state.phase == .done, state.uid == getuid() else { return Leftovers() }
+        return empty(URL(fileURLWithPath: state.aside))
+    }
+
+    /// Removes what is in `folder` and leaves the folder.
+    static func empty(_ folder: URL) -> Leftovers {
+        var left = Leftovers()
+        guard let (parent, name) = Tree.parent(of: folder) else { return left }
+        defer { close(parent) }
+        Tree.remove(name, in: parent, at: folder.path, itself: false, left: &left)
+        return left
     }
 
     /// Whether `name` has a login session: at the Mac, also one it only switched away from, or
@@ -226,8 +364,13 @@ public enum HomeRestore {
     }
 
     /// Lets the restored folder take the place of the home folder, which moves to `aside`. When
-    /// the second step fails the first is undone.
-    public static func swap(home: URL, restored: URL, aside: URL) throws {
+    /// the second step fails the first is undone. The folder the restore worked in is empty
+    /// after and goes.
+    public static func swap(_ places: Places) throws {
+        let (home, restored, aside) = (places.home, places.restored, places.aside)
+        // What is in a folder that others could get into is not known to be what was restored.
+        try checkStaging(places.staging)
+        guard exists(restored) else { throw Failure(description: "The restored folder is no longer at \(restored.path).") }
         guard !exists(aside) else { throw Failure(description: "\(aside.path) is there already. Move it out of the way first.") }
         let hadHome = exists(home)
         if hadHome, rename(home.path, aside.path) != 0 {
@@ -239,31 +382,17 @@ public enum HomeRestore {
             if hadHome { rename(aside.path, home.path) }
             throw Failure(description: "The restored folder could not take the place of \(home.path): \(reason). It is still at \(restored.path).")
         }
+        rmdir(places.staging.path)
     }
 
-    // MARK: - Walking
+    // MARK: - Owners and ACLs
 
-    /// Calls `body` for every item below `root` and `root` itself, without following links or
-    /// leaving the volume.
-    static func walk(_ root: URL, _ body: (String, stat) -> Void) {
-        var paths: [UnsafeMutablePointer<CChar>?] = [strdup(root.path), nil]
-        defer { free(paths[0]) }
-        guard let fts = fts_open(&paths, FTS_PHYSICAL | FTS_XDEV | FTS_NOCHDIR, nil) else { return }
-        defer { fts_close(fts) }
-        while let entry = fts_read(fts) {
-            let kind = Int32(entry.pointee.fts_info)
-            guard kind != FTS_DP, kind != FTS_DNR, kind != FTS_ERR, kind != FTS_NS, let info = entry.pointee.fts_statp else { continue }
-            body(String(cString: entry.pointee.fts_path), info.pointee)
-        }
-    }
-
-    /// Runs `change` with Finder's lock off the item, which keeps even root from changing its
-    /// owner or ACL, and puts the lock back after.
-    static func unlocked(_ path: String, _ info: stat, _ change: () -> Bool) -> Bool {
-        let locks = UInt32(UF_IMMUTABLE | UF_APPEND)
-        let locked = info.st_flags & locks != 0
-        if locked { lchflags(path, info.st_flags & ~locks) }
-        defer { if locked { lchflags(path, info.st_flags) } }
+    /// Runs `change` with Finder's lock off the open item, which keeps even root from changing
+    /// its owner or ACL, and puts the lock back after.
+    static func unlocked(_ fd: Int32, _ info: stat, _ change: () -> Bool) -> Bool {
+        let locked = info.st_flags & Tree.locks != 0
+        if locked { fchflags(fd, info.st_flags & ~Tree.locks) }
+        defer { if locked { fchflags(fd, info.st_flags) } }
         return change()
     }
 
@@ -276,9 +405,9 @@ public enum HomeRestore {
         }
     }
 
-    /// Calls `body` with the id each ACL entry of `path` names, until it returns true.
-    static func forEachQualifier(_ path: String, _ body: (UUID, acl_entry_t) -> Bool) {
-        guard let acl = acl_get_link_np(path, ACL_TYPE_EXTENDED) else { return }
+    /// Calls `body` with the id each ACL entry of the open item names, until it returns true.
+    static func forEachQualifier(_ fd: Int32, _ body: (UUID, acl_entry_t) -> Bool) {
+        guard let acl = acl_get_fd_np(fd, ACL_TYPE_EXTENDED) else { return }
         defer { acl_free(UnsafeMutableRawPointer(acl)) }
         var stop = false
         forEachEntry(acl) { entry in

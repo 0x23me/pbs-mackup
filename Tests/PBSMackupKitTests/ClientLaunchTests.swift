@@ -233,14 +233,15 @@ extension PrivateHomeTests {
     #expect(home.noted("program") == nil)
 
     // A file that passes and a program that does not: the script is now signed under a name,
-    // but what runs it is /bin/sh. It is started, and stopped before it gets anything. That
-    // goes for a command without a key as well: it would still get the token.
+    // but what runs it is /bin/sh. It is started, and stopped before it runs one line of the
+    // script. That goes for a command without a key as well: it would still get the token.
     let signed = tool("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier", "pbs-mackup-test-client", client.executable.path])
     try #require(signed.status == 0, "\(signed.output)")
     let named = try #require(Signature.requirement("identifier \"pbs-mackup-test-client\""))
     #expect(Signature.isSigned(client.executable, as: named))
     for usesKey in [true, false] {
-        #expect(failure { _ = try start(usesKey: usesKey, signedAs: named) }?.contains("stopped before it got the token or the key") == true)
+        #expect(failure { _ = try start(usesKey: usesKey, signedAs: named) }?.contains("stopped before it ran") == true)
+        #expect(home.noted("program") == nil)
         #expect(home.noted("input") != "KEY")
         #expect(home.noted("token") == nil)
     }
@@ -269,8 +270,11 @@ extension PrivateHomeTests {
         "ALL_PROXY": "http://127.0.0.1:1", "PBS_REPOSITORY": "other@pbs@example.net:store", "PBS_FINGERPRINT_CMD": "/tmp/elsewhere/bin/x",
         "PBS_PASSWORD_FILE": "/tmp/elsewhere/token", "CREDENTIALS_DIRECTORY": "/tmp/elsewhere", "XDG_CONFIG_HOME": "/tmp/elsewhere",
         "DYLD_INSERT_LIBRARIES": "/tmp/elsewhere/x.dylib", "PBS_MACKUP_STUB": "ok"])
+    // The home folder and the folders in it are the client's own, whatever the tool was given.
+    let own = Paths.guarded.appendingPathComponent("client").path
     #expect(environment == [
-        "HOME": Paths.home.path, "USER": NSUserName(), "LOGNAME": NSUserName(),
+        "HOME": own, "XDG_CONFIG_HOME": own + "/.config", "XDG_CONFIG_DIRS": own + "/.config", "XDG_CACHE_HOME": own + "/.cache",
+        "USER": NSUserName(), "LOGNAME": NSUserName(),
         "TMPDIR": NSTemporaryDirectory(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LANG": "de_DE.UTF-8",
         "SSL_CERT_FILE": "/etc/ssl/cert.pem", "SSL_CERT_DIR": "/etc/ssl/certs", "OPENSSL_CONF": "/dev/null",
         "PBS_MACKUP_STUB": "ok"])              // only a development build passes PBS_MACKUP_ on, for the stand-in client
@@ -300,7 +304,7 @@ extension PrivateHomeTests {
     #expect(environment["SSL_CERT_FILE"] == "/etc/ssl/cert.pem")
     #expect(environment["ALL_PROXY"] == nil)
     #expect(environment["PBS_FINGERPRINT_CMD"] == nil)
-    #expect(environment["HOME"] == home.folder.path)                 // the client's own files stay in the private home
+    #expect(environment["HOME"] == Paths.clientHome.path)            // a home of its own, see theClientsHomeIsItsOwn
     #expect(home.noted("arguments") == "snapshot\nlist\nhost/test-mac\n--output-format\njson\n--ns\ntest\n")
     #expect(home.noted("input") == "")                               // a command that takes no key gets none
 
@@ -311,6 +315,108 @@ extension PrivateHomeTests {
     #expect(environment["PBS_FINGERPRINT"] == "aa:bb")
     #expect(home.noted("arguments") == "catalog\nlist\n\(snapshot)\nDownloads.pxar\n/\n--ns\ntest\n--keyfd\n0\n")
     #expect(home.noted("input") == "KEY")
+}
+
+@Test func theClientsHomeIsItsOwn() throws {
+    let home = try Home()
+    defer { home.remove() }
+    try Keychain.set(.token, Data("right-token".utf8))
+    let client = try Client(config: home.config, needsKey: false)
+    func mode(_ folder: URL) -> Int? { (try? FileManager.default.attributesOfItem(atPath: folder.path))?[.posixPermissions] as? Int }
+
+    // What the client takes for the owner's settings (a master key that every backup's key is
+    // uploaded for, fingerprints of certificates to take) it looks for in its home. That is
+    // not the owner's, where any program can write, and not the folder the tests moved the
+    // app's files to, but a folder where other programs are kept out, made before the client
+    // starts and open to nobody else.
+    try client.checkConnection()
+    let own = Paths.guarded.appendingPathComponent("client"), settings = own.appendingPathComponent(".config")
+    let environment = home.environment
+    #expect(environment["HOME"] == own.path)
+    #expect(own.path != Paths.home.path && own.path != home.folder.path)
+    #expect(environment["XDG_CONFIG_HOME"] == settings.path && environment["XDG_CONFIG_DIRS"] == settings.path)
+    #expect(environment["XDG_CACHE_HOME"] == own.appendingPathComponent(".cache").path)
+    #expect(environment["XDG_RUNTIME_DIR"] == nil)                  // no ticket is written to disk
+    for folder in [own, settings, own.appendingPathComponent(".cache")] { #expect(mode(folder) == 0o700, "\(folder.path)") }
+
+    // A folder that was opened to others is closed again.
+    #expect(chmod(settings.path, 0o755) == 0)
+    try client.checkConnection()
+    #expect(mode(settings) == 0o700)
+
+    // In its place a link to a folder of someone else's making: no client is started with that.
+    let planted = home.folder.appendingPathComponent("planted")
+    try FileManager.default.createDirectory(at: planted.appendingPathComponent("proxmox-backup"), withIntermediateDirectories: true)
+    try FileManager.default.removeItem(at: settings)
+    try FileManager.default.createSymbolicLink(at: settings, withDestinationURL: planted)
+    try FileManager.default.removeItem(at: home.folder.appendingPathComponent("client-program"))
+    #expect(failure { try client.checkConnection() }?.contains("is not a folder of this user alone") == true)
+    #expect(home.noted("program") == nil)
+    // The same for the key commands, which start their client the same way.
+    #expect(failure { _ = try KeyStore.create(client: client.executable) }?.contains("is not a folder of this user alone") == true)
+    #expect(home.noted("program") == nil)
+}
+
+@Test func aClientIsLookedAtBeforeItRunsWhateverItIsStartedFor() throws {
+    let home = try Home()
+    defer { home.remove() }
+    let named = try #require(Signature.requirement("identifier \"pbs-mackup-test-client\""))
+    func sign(_ program: URL) throws {
+        let signed = tool("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier", "pbs-mackup-test-client", program.path])
+        try #require(signed.status == 0, "\(signed.output)")
+    }
+
+    // A program that is what its file says is let run, and gets its input: a copy of cat,
+    // signed under the name that is asked for.
+    let cat = try adHocCopy(of: "/bin/cat", in: home.folder.appendingPathComponent("signed"))
+    try sign(cat)
+    let passed = try Client.launch(cat, [], input: [0: Data("made it".utf8)], signedAs: named).finish()
+    #expect(passed.status == 0 && String(decoding: passed.output, as: UTF8.self) == "made it")
+
+    // The stand-in is signed under that name too, but what runs it is /bin/sh. The program
+    // that makes a key knows the key, and there is no input to keep from it: it must not run
+    // at all, and it does not. Nothing is stored and nothing is left of the key's folder.
+    let client = URL(fileURLWithPath: try #require(home.config.clientPath))
+    try sign(client)
+    func leftOver() throws -> [String] { try FileManager.default.contentsOfDirectory(atPath: Paths.guarded.path).filter { $0.hasPrefix("key-") } }
+    #expect(failure { _ = try KeyStore.create(client: client, signedAs: named) }?.contains("stopped before it ran") == true)
+    #expect(home.noted("program") == nil)
+    #expect(try Keychain.get(.encryptionKey) == nil)
+    #expect(try leftOver() == [])
+    // The same for the one that takes the passphrase off a key.
+    let locked = Data(#"{"kdf":{"Scrypt":{"n":65536,"r":8,"p":1,"salt":"c2FsdA=="}},"data":"bm90IGEgcmVhbCBrZXk=","fingerprint":"aa:bb:cc"}"#.utf8)
+    #expect(failure { _ = try KeyStore.importKey(locked, passphrase: "correct horse", client: client, signedAs: named) }?
+        .contains("stopped before it ran") == true)
+    #expect(home.noted("program") == nil)
+    #expect(try Keychain.get(.encryptionKey) == nil)
+    #expect(try leftOver() == [])
+
+    // It is not a matter of looking quicker than the program runs. Here the look takes its
+    // time, and the program would be done long before: touch, which makes the file it is
+    // told to. Its file passes as Apple's; what runs is asked for a name it does not have.
+    let touch = URL(fileURLWithPath: "/usr/bin/touch"), mark = home.folder.appendingPathComponent("touched")
+    let apple = try #require(Signature.requirement("anchor apple"))
+    let refused = failure {
+        _ = try Client.launch(touch, [mark.path], signedAs: apple) { pid, _ in
+            usleep(300_000)
+            return Client.runs(pid, as: named)
+        }
+    }
+    #expect(refused?.contains("stopped before it ran") == true)
+    #expect(!FileManager.default.fileExists(atPath: mark.path))
+    // (Let run, it makes the file.)
+    #expect(try Client.launch(touch, [mark.path], signedAs: apple).finish().status == 0)
+    #expect(FileManager.default.fileExists(atPath: mark.path))
+
+    // And a file that is not signed as asked is not started for either.
+    let team = try #require(Signature.requirement(team: "33C888LZ98"))
+    #expect(failure { _ = try KeyStore.create(client: client, signedAs: team) }?.contains("so it was not started") == true)
+    #expect(failure { _ = try KeyStore.importKey(locked, passphrase: "correct horse", client: client, signedAs: team) }?
+        .contains("so it was not started") == true)
+
+    // Nothing is asked of a development build's client: it is let run, and here makes no key.
+    #expect(failure { _ = try KeyStore.create(client: client, signedAs: nil) }?.contains("could not create a key") == true)
+    #expect(home.noted("program") != nil)
 }
 
 @Test func whatTheServerListsUnderAnotherNameIsLeftOut() throws {
@@ -391,6 +497,36 @@ extension PrivateHomeTests {
     #expect(home.noted("token") == "right-new-token\n")             // the server had accepted it
     #expect(try Keychain.get(.token) == Data("right-token".utf8))
     #expect(try Config.load() == home.config)
+}
+
+/// Where the client looks for a master key, which decides whether a backup uploads its
+/// encryption key for somebody: in the home it is given, and so nowhere another program can
+/// write. Runs with the real client when PBS_MACKUP_CLIENT names one.
+@Test(.enabled(if: ProcessInfo.processInfo.environment["PBS_MACKUP_CLIENT"].map(FileManager.default.isExecutableFile) == true))
+func theRealClientFindsAMasterKeyOnlyInItsOwnHome() throws {
+    let home = try Home()
+    defer { home.remove() }
+    let client = URL(fileURLWithPath: try #require(ProcessInfo.processInfo.environment["PBS_MACKUP_CLIENT"]))
+    // The public half of a key pair, as `key create-master-key` leaves it.
+    let pair = home.folder.appendingPathComponent("master.pem"), half = home.folder.appendingPathComponent("master-public.pem")
+    try #require(tool("/usr/bin/openssl", ["genrsa", "-out", pair.path, "2048"]).status == 0)
+    try #require(tool("/usr/bin/openssl", ["rsa", "-in", pair.path, "-pubout", "-out", half.path]).status == 0)
+    func plant(in settings: URL) throws {
+        try FileManager.default.createDirectory(at: settings.appendingPathComponent("proxmox-backup"), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: half, to: settings.appendingPathComponent("proxmox-backup/master-public.pem"))
+    }
+    func shown() throws -> String {
+        String(decoding: try Client.launch(client, ["key", "show-master-pubkey"], mergingErrors: true, signedAs: nil).finish().output, as: UTF8.self)
+    }
+
+    // Where the client looked while its home was the folder the app's files are in, which in
+    // an installed app was the owner's home: `.config` there.
+    try plant(in: home.folder.appendingPathComponent(".config"))
+    #expect(try shown().contains("no default master key available"))
+    // It does look for one, in its own home.
+    try plant(in: Paths.clientHome.appendingPathComponent(".config"))
+    let found = try shown()
+    #expect(found.contains("master-public.pem") && !found.contains("no default master key available"), "\(found)")
 }
 
 /// The fork's command line parser, which `Client.pathArgument` is written for. Runs with the real

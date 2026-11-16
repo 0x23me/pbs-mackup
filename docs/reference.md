@@ -7,7 +7,8 @@ the place to start.
 
 - `PBSMackup.app`: the menu bar app. Shows the state, starts and cancels backups, browses
   snapshots and restores items. It registers the launchd job.
-- `pbs-mackup-run`, in the app: performs one backup run and exits. launchd starts it every five
+- `pbs-mackup-run`, in the app (in a bundle of its own there, `Contents/Helpers/PBSMackupRun.app`,
+  with `Contents/MacOS/pbs-mackup-run` as a link to it): performs one backup run and exits. launchd starts it every five
   minutes and it runs when a backup is due: one interval after the last successful backup began.
   A run that was skipped (server not reachable, on battery) is tried again five minutes later. A
   failed run is tried again a quarter of an hour after it ended, then after twice as long each
@@ -22,7 +23,16 @@ the place to start.
   loads only libraries macOS ships. The run tool hands the client the key on standard
   input and the token on a descriptor of its own, so neither shows in its arguments or its
   environment, and a release build first checks that it is the client the app's developer
-  signed.
+  signed: the file before it starts it, and the started program before that runs. The client
+  starts suspended for this, whether it is to back up, to make a key or to unlock one, and one
+  that does not pass is stopped without having run. The client's home folder is not yours but
+  one of its own, `client` in the group container (see below). What it reads from
+  `.config/proxmox-backup` in its home would otherwise be for any program of yours to write: a
+  `master-public.pem` there makes every backup upload its encryption key, encrypted for
+  whoever has the other half; a line in `fingerprints` makes the client accept a certificate
+  it would turn away; an `encryption-key.json` is the key of a command that was given none.
+  A file of that kind in your own home folder, left by a `proxmox-backup-client` you used
+  yourself, is not read by the app.
 
 ## Files
 
@@ -32,9 +42,10 @@ the place to start.
 | `~/Library/Application Support/pbs-mackup/state.json` | what happened and what is happening, see below |
 | `~/Library/Application Support/pbs-mackup/paused` | an empty file that is there while automatic backups are paused; the app makes and removes it, the run tool only looks for it |
 | `~/Library/Application Support/pbs-mackup/logs/` | one log per run, kept for 30 days |
-| `~/Library/Caches/pbs-mackup/` | the run lock, the files opened from a backup to look at (`preview`, removed when the Backups window closes and when the app quits or starts), the names in the snapshots that were searched (`index`, removed two weeks after the last use), the last measurement of each backed-up folder (`sizes`, folder names and sizes), and during a run the list of changed folders (`changed-folders`), a marker file for the change log (`changes`) and the settings manifest (`settings.json`, see below) |
-| `~/Library/Group Containers/<Team ID>.<bundle identifier>/` | what no other program is to read or write. macOS asks the owner before it lets a program of another developer into this folder. `mnt` is where a run mounts its APFS snapshot, with its copy of Mail, Messages and the like; `check-…` holds the files a run restores to compare them, `key-…` a new or imported key on its way into the Keychain, both only for a moment. `seal.json` is what the app and the run tool last stored themselves, as two digests: of the configuration and of the encryption key. An app built without a developer's identity has no such folder: it keeps the seal with `config.json` and the rest in the cache, where they are open to every program of the user |
-| login Keychain, service `<bundle identifier>.tool` | the API token secret (`token`) and the encryption key (`encryption-key`). The Keychain hands them to the run tool, which signs under that name. Versions before 0.2 kept them under the bundle identifier itself; 0.2 moves them when the app first starts, and macOS asks for the login password for each |
+| `~/Library/Caches/pbs-mackup/` | the run lock, the files opened from a backup to look at (`preview`, removed when the Backups window closes and when the app quits or starts), and during a run a marker file for the change log (`changes`, an empty file). Versions up to 0.5.0 also kept `index`, `sizes`, `changed-folders` and `settings.json` here; the next run removes them |
+| `~/Library/Group Containers/<Team ID>.<bundle identifier>/` | what no other program is to read or write. macOS asks the owner before it lets a program of another developer into this folder. `mnt` is where a run mounts its APFS snapshot, with its copy of Mail, Messages and the like; `check-…` holds the files a run restores to compare them, `key-…` a new or imported key on its way into the Keychain, both only for a moment: whoever makes such a folder holds a lock on it (`flock`) while it uses it, and one that a killed command or a power cut left behind, its lock free, is removed by the next run and when the helper next starts. `client` is the home folder the client is given, with `.config` and `.cache` in it, each for the owner alone (mode 700); the client notes the repositories it was used with there (`.cache/proxmox-backup/repo-list`), and the app puts nothing into it. What names the owner's files is here too: the names in the snapshots that were searched (`index`, removed two weeks after the last use), the last measurement of each backed-up folder (`sizes`, folder names and sizes), both marked as left out of backups the way an app marks a folder for Time Machine, and during a run the list of changed folders (`changed-folders`) and the settings manifest (`settings.json`, see below). `seal.json` is what the app and the run tool last stored themselves, as two digests: of the configuration and of the encryption key. An app built without a developer's identity has no such folder: it keeps the seal with `config.json` and the rest in the cache, where they are open to every program of the user |
+| data protection keychain, access group `<Team ID>.<bundle identifier>`, service `<bundle identifier>.tool` | the API token secret (`token`) and the encryption key (`encryption-key`), for this Mac alone, readable once the Mac was unlocked after it started. macOS lets only a program in that access group read, make, replace or delete these items, and a program is in it only by a provisioning profile of the developer: the run tool is, and nothing else, not the app and not the client. Versions 0.2 to 0.5 kept the items in the login keychain under the same service. The run tool takes them over from there the first time it needs one and finds none of its own, and removes them there, so the run tools of those versions find nothing. The key is taken over only when it is the one in `seal.json`; any other key stays where it is and is not used, and Settings asks for the recovery copy. The token is taken over as it is. An item there that macOS would ask you about is another program's and is left alone |
+| login keychain, service `<bundle identifier>.tool` | the same two items in an app built without a provisioning profile for the run tool (see [building](building.md)), and up to 0.5.0. This keychain hands an item to the program that stored it, and lets any program delete an item and make one under the same name. So a secret is stored by removing the item and making it anew, never by changing it, so that an item another program made first under this name, to read what is stored in it, goes away with that. Where the run tool cannot remove such an item, nothing is stored and the error says which item to delete. Versions before 0.2 kept the items under the bundle identifier itself; nothing is taken over from there |
 
 `config.json`:
 
@@ -84,14 +95,15 @@ reading standard input and each asking for Touch ID or the login password first.
 refuses a key file that is locked with a passphrase; `unlock-key` takes it, as
 `{"key": "…", "passphrase": "…"}` on standard input with the text of the key file or of the paper
 key. The client's `key change-passphrase --kdf none` takes the passphrase off, in a `key-…`
-folder that is removed right after, and the key is stored without it. The client gets the
+folder that is removed right after (or, when the command is killed, by the next run), and the
+key is stored without it. The client gets the
 passphrase on a descriptor of its own (`PBS_ENCRYPTION_PASSWORD_FD`), never in its arguments or
 environment. The settings window asks for the passphrase when the chosen file has one.
 
 ## How sizes are measured
 
 The sizes come from `pbs-mackup-run sizes <folder>`, which reads the size of every file once
-(65 s for a home folder with 2.4 million files) and keeps the result in the cache; the window
+(65 s for a home folder with 2.4 million files) and keeps the result in `sizes` (see Files); the window
 opens with the last measurement and measures again when that is older than a day. Sizes are
 what the files take on disk, as Finder and `du` count them. Three things make the amount to
 back up smaller than the folder:
@@ -118,10 +130,19 @@ pbs-mackup-run settings <snapshot>
 ```
 
 Started this way, and not by the app, the tool asks for Touch ID or the login password before
-it does any of these but `sizes`: any program of yours can start it, and it is
-the one the Keychain hands the token and the key to.
+it does any of these: any program of yours can start it, and it is
+the one the Keychain hands the token and the key to. `sizes` asks as well: with Full Disk
+Access the tool reads the names in any folder.
 
-`settings` prints the settings manifest of a snapshot (see below). `index` writes the names in a snapshot to a JSON file in the cache. A snapshot is named
+Each command says in the tool's list (`commands` in `Sources/RunTool/main.swift`) who may ask
+for it, and anyone else is refused before anything is done: the app over the helper's
+connection, a program started as you (a terminal, a launchd job), or root. The app gets what
+its windows ask for: these seven, `accept`, `setup-status`, the commands for the key, and
+`set-token`, which it uses only after a restore of the home folder (see below). A run, `serve`,
+`status`, `check`, `seal` and `certificate` are only started as a program, and `restore-home`
+and `restore-daemon` only as root, which the others refuse.
+
+`settings` prints the settings manifest of a snapshot (see below). `index` writes the names in a snapshot to a JSON file in `index` (see Files). A snapshot is named
 `host/<id>/2026-11-12T08:00:00Z` and an archive `<folder>.pxar`; anything else is refused.
 
 Without an argument it does one scheduled run, `--manual` one that ignores the interval and
@@ -136,8 +157,9 @@ server accepts them. The settings window saves through it.
 `export-key <file>` writes the recovery copy of the key, readable by you only, and `paper-key`
 prints it as text; both ask for Touch ID or the login password first, also when the app asks for
 them, and so do `create-key --replace` and a `set-key` or `unlock-key` that replaces a key. `seal` makes a
-`config.json` that was edited by hand the one to go by. `migrate` moves the token and the key
-that a version before 0.2 stored; the app asks for it when it starts. `serve` is the helper job:
+`config.json` that was edited by hand the one to go by, also when no configuration is noted
+at all (the seal is gone, say): nothing notes a configuration or a key by itself just because
+it is there. For the key it is `set-key` or `unlock-key` with the recovery copy. `serve` is the helper job:
 it answers the app until launchd stops it. `certificate <host> <port>` prints the server
 certificate's fingerprint and whether the client takes it without one, judged by the roots in
 `/etc/ssl/cert.pem`. Called with a command it doesn't know, the tool lists all of them.
@@ -186,25 +208,50 @@ For a Mac that was set up anew; the steps around it are in the README ("After lo
 It runs as root and only from a terminal, never for the app, and takes nothing from a Keychain:
 the token secret is asked for (or read from standard input when that is not a terminal), the
 key comes from the recovery file, and a key file locked with a passphrase asks for it. The
-client gets all three on descriptors, as in a backup.
+client gets all three on descriptors, as in a backup. Nothing stores them for the user
+afterwards: root cannot reach the user's Keychain. The user enters the token in Settings and
+imports the recovery copy. A backup made without a provisioning profile for the run tool, or by
+0.5 or earlier, has them in the login keychain, which comes back with the home folder.
 
 It refuses when the user does not exist, has programs running (logged in, also when the Mac only
-switched to another user) or is the one who started `sudo`, when `<home>.restored` or
-`<home>.before-restore` is already there, and when the disk has less room than the snapshot
+switched to another user) or is the one who started `sudo`, when a restore that did not finish
+or `<home>.before-restore` is already there, and when the disk has less room than the snapshot
 takes. The archive is the one named after the user's home folder (`me.pxar`), and the snapshot
 the newest that has it, of the one backup group that has it; with two such groups `--from` says
 which. Then, after a question that `--yes` answers:
 
-1. The archive is restored as `<home>.restored`, with owners, permissions, ACLs, flags and the
-   Mac metadata. A restore that fails leaves nothing behind.
+1. The archive is restored as `/Users/.pbs-mackup-restore-<name>/<name>`, with owners,
+   permissions, ACLs, flags and the Mac metadata. A restore that fails leaves nothing behind.
 2. When the restored folder belongs to another uid than the user has on this Mac, everything of
    that uid becomes the user's.
 3. macOS names a user in an ACL by a GeneratedUID, which a new account gets anew. When the ACLs
    name exactly one id this Mac does not know, that is the owner as the old Mac knew them, and
    it is replaced with the user's id here. By default only `Public/Drop Box` has such an ACL.
-4. The home folder becomes `<home>.before-restore` and the restored one takes its place. When
+4. The cloud folders are taken out (`Library/Mobile Documents`, `Library/CloudStorage`, iCloud
+   Drive's file provider and its state); their contents come back from the cloud.
+5. The home folder becomes `<home>.before-restore` and the restored one takes its place. When
    the second step fails the first is undone. Moving a home folder needs Full Disk Access for
-   the terminal.
+   the terminal. `.pbs-mackup-restore-<name>` is empty then and removed.
+
+### Where root works
+
+A restored folder belongs to its user from the first file on, and the user can log in while
+root still works in it. Whoever owns a folder can put a link where root is about to go by path,
+which sends root's change of an owner, or its delete, to any file on the Mac. So:
+
+- The restore happens in `/Users/.pbs-mackup-restore-<name>`: root's, mode 700, no ACL, on the
+  volume of the home folder so that the swap is a rename. One that is already there is used
+  only when it is exactly that; anything else is refused and left alone. Nobody but root gets
+  at the restored folder before it is the home folder.
+- Below the restored folder root uses no paths. Each folder is opened from the one above it
+  and never through a link, the volume is not left, and owners, flags and ACLs are changed on
+  a descriptor of the item itself, after checking that it is the item that was looked at. A
+  link has such a descriptor too, of its own. Sockets, pipes and devices have none: their
+  owner changes by their name in the open folder, and their ACLs are left as they are.
+- Root deletes only inside `.pbs-mackup-restore-<name>`: the cloud folders, and a restore that
+  failed or was cancelled. The home folder that is set aside is its owner's, who can reach it;
+  root removes it only once it is empty (see below), and `restore-home` leaves it for an
+  administrator to delete.
 
 ### From the app
 
@@ -218,14 +265,41 @@ needs it and unregisters at Finish; macOS asks the owner to allow it under Login
   `<bundle identifier>.restore-home`, which the daemon checks without asking anyone. Its rule:
   an administrator authenticates, and that holds for five minutes in that one authorization.
   An administrator can change it with `security authorizationdb`; a rule of their own is kept.
-- Token, key and passphrase arrive in the messages and go to the client on descriptors.
-- The restore goes to `<home>.restored`; the state, without secrets, is in
-  `/Library/Application Support/<bundle identifier>/restore.json`. Once the user has no login
-  session left, the daemon ends what macOS keeps running for them (their launchd domain, then
-  any program still running as them) and swaps the folders. A login before that puts the swap
-  off to the next logout; a restart while restoring throws the restore away.
-- The cloud folders are left out (`Library/Mobile Documents`, `Library/CloudStorage`, iCloud
-  Drive's file provider and its state); their contents come back from the cloud.
+- Token, key and passphrase arrive in the messages and go to the client on descriptors. The
+  daemon keeps them in its memory, never on disk, until Finish or a failure.
+- The data protection keychain lives in the home folder, in `Library/Keychains/<hardware UUID>`,
+  and opens only on the Mac that made it. So the one that holds the token and the key goes with
+  the home folder that is set aside, and the restored one has none this Mac can open. After the
+  swap, when the user logs in, the app opens the restore window and first asks the daemon for
+  the token, the key and its passphrase. The daemon gives them only to the app (by its
+  signature), only to the user whose home folder it restored, and only between the swap and
+  Finish; no administrator is asked, since it hands back what the app sent. The app has the run
+  tool store them, as the user: the token with `set-token`, and the key with `set-key` or
+  `unlock-key` when the Keychain has none, or one the app did not put there (which asks for
+  Touch ID or the password). A key the app put there stays: it is the key the backups were made
+  with. Storing the key notes it in the restored `seal.json`; the configuration's seal comes back
+  with the home folder. When the Mac restarted between the restore and the login, the daemon has
+  nothing to give: the window says so, and the user enters the token in Settings and imports
+  the recovery copy, as before.
+- The restore goes to `/Users/.pbs-mackup-restore-<name>/<name>`, as above; the state, without
+  secrets, is in `/Library/Application Support/<bundle identifier>/restore.json`. Once the user
+  has no login session left, the daemon ends what macOS keeps running for them (their launchd
+  domain, then any program still running as them) and swaps the folders. A login before that
+  puts the swap off to the next logout; a restart while restoring throws the restore away.
+- Cancelling, and Start Over after a failure, remove `.pbs-mackup-restore-<name>` with what is
+  in it.
+- Finish, after the swap, is the owner's: the daemon refuses it from another account. The app
+  deletes what is in `<home>.before-restore`, as the user and with its own Full Disk Access,
+  and the daemon then removes the folder itself from `/Users`, which only root can, and only
+  when it is empty. What the user may not delete (a folder root made in there, say) is listed,
+  and the owner chooses between trying again and finishing with the rest left in place, for an
+  administrator to remove (`sudo rm -rf`). Nothing is handed to root to delete.
+- Every finish also removes the state, its folder and the right from the authorization
+  database, unless an administrator changed the rule. `brew uninstall --zap` removes all of
+  these for an app that goes in the middle of a restore.
+- A restore that 0.5.0 or earlier left waiting for the logout lies in `<home>.restored`, which
+  its owner could change. This version does not put it in place: it says so, and the restore
+  is started again once an administrator has removed that folder.
 
 ## When a run reads everything
 
@@ -252,7 +326,7 @@ watches the folder and reads the file whenever it was replaced. Dates are ISO 86
 | Field | Meaning |
 |---|---|
 | `version` | `1` |
-| `paused` | no longer used and always `false`: whether automatic backups are paused is the file `paused` next to the state file. A `true` left by an earlier version is moved there by the next run |
+| `paused` | no longer used and always `false`: whether automatic backups are paused is the file `paused` next to the state file. Nothing reads the field; it is written because the versions 0.2 to 0.5 cannot read a state file without it |
 | `running` | present while a run is active, see below |
 | `localSnapshot` | date of the APFS snapshot the active run took, written before it is mounted so that the next run can remove it after a crash |
 | `last` | the record of the most recent run. A scheduled run that is skipped for the same reason as the record before it leaves no record of its own |

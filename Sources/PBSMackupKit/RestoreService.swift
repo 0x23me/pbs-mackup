@@ -9,7 +9,8 @@ import Security
 /// reads the backups or changes something carries the app's authorization for
 /// `Identity.restoreRight`, which an administrator gave by authenticating. Token, key and
 /// passphrase only ever travel in these messages and from the daemon to the client on
-/// descriptors; nothing of them is written down.
+/// descriptors; nothing of them is written down. The daemon keeps them in its memory until the
+/// restore is finished, for the app to store again after the swap (`secrets`).
 @objc public protocol RestoreProtocol {
     /// The snapshots that hold the home folder of the user who asks, newest first, as
     /// `RestoreChoices` in JSON. `request` is a `RestoreRequest` in JSON, without a snapshot.
@@ -20,9 +21,20 @@ import Security
     func start(_ request: Data, authorization: Data, reply: @escaping (String?) -> Void)
     /// The `RestoreState` in JSON, or nil when no restore is under way or done.
     func status(reply: @escaping (Data?) -> Void)
-    /// After the swap: removes the home folder that was set aside. Before it: gives up the
-    /// restore and removes what was restored. Answers with an error as a sentence, or nil.
+    /// Ends the restore, and with it what the daemon keeps: its state and the right in the
+    /// authorization database. Before the swap that gives the restore up and removes what was
+    /// restored. After it only the user whose home folder it is can ask: their app has
+    /// deleted what is in the folder that was set aside (`HomeRestore.emptyAside`), as them,
+    /// and the daemon removes the folder when that left it empty. Answers with an error as a
+    /// sentence, or nil.
     func finish(authorization: Data, reply: @escaping (String?) -> Void)
+    /// The token, the key and its passphrase the restore was started with, as `RestoreSecrets`
+    /// in JSON, for the app to store again once the restored home folder is in place: the
+    /// Keychain they were in is part of the home folder that was set aside. Only to the user
+    /// whose home folder it is, and only between the swap and Finish. No administrator is
+    /// asked: the daemon gives the app back what the app sent it. Answers with an error as a
+    /// sentence when there is nothing to give, after a restart say.
+    func secrets(reply: @escaping (Data?, String?) -> Void)
 }
 
 public struct RestoreRequest: Codable {
@@ -47,6 +59,37 @@ public struct RestoreRequest: Codable {
         config.fingerprint = fingerprint
         return Client(config: config, token: Data(token.utf8), key: key, keyPassphrase: passphrase.map { Data($0.utf8) })
     }
+
+    var secrets: RestoreSecrets { RestoreSecrets(token: token, key: key, passphrase: passphrase) }
+}
+
+/// What the owner entered to restore the home folder, for storing again on the Mac after the
+/// swap: the Keychain the token and the key were in stays with the home folder that was set
+/// aside, and the restored one has none that this Mac can open.
+public struct RestoreSecrets: Codable, Equatable {
+    public var token: String
+    /// The key file, as the recovery copy has it.
+    public var key: Data
+    public var passphrase: String?
+
+    public init(token: String, key: Data, passphrase: String?) {
+        self.token = token; self.key = key; self.passphrase = passphrase
+    }
+
+    /// The run tool's commands, each with what it reads in the place of standard input, that
+    /// store these: the token always, since the restore has just worked with it, and the key
+    /// where the Keychain has none, or one the app did not put there (`foreign`), which the run
+    /// tool has the owner confirm. A key the app put there stays: it is the one the restored
+    /// backups were made with. A locked key file goes to `unlock-key` with its passphrase.
+    public func storing(over stored: KeyStore.Status) throws -> [(arguments: [String], input: Data)] {
+        var steps = [(arguments: ["set-token"], input: Data(token.utf8))]
+        guard !stored.present || stored.foreign else { return steps }
+        guard KeyStore.isLocked(key) else { return steps + [(["set-key"], key)] }
+        guard let passphrase else { throw Failure(description: "The key file is locked, and its passphrase is no longer known.") }
+        let locked = try JSONEncoder().encode(["key": String(decoding: key, as: UTF8.self), "passphrase": passphrase])
+        steps.append((["unlock-key"], locked))
+        return steps
+    }
 }
 
 public struct RestoreChoices: Codable {
@@ -55,9 +98,9 @@ public struct RestoreChoices: Codable {
     public let snapshots: [Client.Snapshot]
 }
 
-public struct RestoreState: Codable, Equatable {
-    public enum Phase: String, Codable {
-        /// The client restores the archive next to the home folder.
+public struct RestoreState: Codable, Equatable, Sendable {
+    public enum Phase: String, Codable, Sendable {
+        /// The client restores the archive, in a folder only root can enter.
         case restoring
         /// The restored folder is complete and takes the place of the home folder once its
         /// owner has logged out.
@@ -83,8 +126,9 @@ public struct RestoreState: Codable, Equatable {
         self.archive = archive; self.progress = progress; self.message = message; self.notes = notes
     }
 
-    public var restored: String { home + ".restored" }
-    public var aside: String { home + ".before-restore" }
+    public var places: HomeRestore.Places { HomeRestore.Places(home: URL(fileURLWithPath: home)) }
+    public var restored: String { places.restored.path }
+    public var aside: String { places.aside.path }
 }
 
 public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProtocol, @unchecked Sendable {
@@ -97,6 +141,9 @@ public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProto
     private let log = Logger(subsystem: Identity.bundleID, category: "restore")
     private let lock = NSLock()
     private var current: RestoreState?
+    /// What the restore was started with, until it is finished or fails. Only ever in memory:
+    /// after a restart the owner enters them again.
+    private var secrets: RestoreSecrets?
 
     /// What launchd starts for `Identity.restoreLabel`: answers the app until launchd stops it.
     public static func serve() -> Never {
@@ -113,6 +160,9 @@ public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProto
         // Root takes messages from its own developer's app only: a build that nobody signed
         // has no developer to ask for, so it takes none.
         guard case .team = Signature.own, HelperConnection.restrict(connection, to: Identity.bundleID) else { return false }
+        // Finish takes the right away again. Should the daemon still be here after, the right
+        // is back before the app asks an administrator for it.
+        RestoreService.defineRight()
         connection.exportedInterface = NSXPCInterface(with: RestoreProtocol.self)
         connection.exportedObject = self
         connection.resume()
@@ -151,17 +201,17 @@ public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProto
                 }
                 try RestoreService.preflight(state, size: snapshot.size)
                 current = state
+                secrets = request.secrets
                 save()
             }
             log.notice("restoring \(archive, privacy: .public) from \(snapshot.name, privacy: .public) for uid \(account.uid)")
             reply(nil)
             DispatchQueue.global(qos: .userInitiated).async { [self] in
                 do {
-                    try HomeRestore.restore(client, snapshot: snapshot.name, archive: archive,
-                                            into: URL(fileURLWithPath: state.restored)) { output in
+                    try HomeRestore.restore(client, snapshot: snapshot.name, archive: archive, into: state.places) { output in
                         if let progress = RestoreService.progress(in: output) { update { $0.progress = progress } }
                     }
-                    state.notes = HomeRestore.adapt(URL(fileURLWithPath: state.restored), to: account)
+                    state.notes = HomeRestore.adapt(state.places.restored, to: account)
                     update { $0.phase = .waitingForLogout; $0.progress = 1; $0.notes = state.notes }
                     waitForLogout()
                 } catch {
@@ -182,23 +232,54 @@ public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProto
     public func finish(authorization: Data, reply: @escaping (String?) -> Void) {
         do {
             try RestoreService.check(authorization)
+            let asking = NSXPCConnection.current()?.effectiveUserIdentifier
             try lock.withLock {
-                guard let state = current else { return }
-                switch state.phase {
+                switch current?.phase {
                 case .restoring:
                     throw Failure(description: "The restore is still running.")
                 case .waitingForLogout, .failed:
-                    removeRestored(URL(fileURLWithPath: state.restored))
+                    // In the folder only root can enter; nobody else had a hand in it.
+                    if let current { HomeRestore.discard(current.places) }
                 case .done:
-                    removeRestored(URL(fileURLWithPath: state.aside))
+                    guard let state = current else { break }
+                    // The folder set aside is its owner's, who can reach it: root deletes
+                    // nothing in it. Their app has, as them, and only an empty folder goes.
+                    // From another account nobody did, and the restore stays the owner's to end.
+                    guard asking == state.uid else {
+                        throw Failure(description: "This restore is \(state.user)'s. \(state.user) finishes it from their own account, "
+                            + "where the home folder that was set aside is deleted as them.")
+                    }
+                    rmdir(state.aside)
+                case nil:
+                    break
                 }
-                current = nil
-                try? FileManager.default.removeItem(at: RestoreService.stateFile)
+                forget()
             }
             reply(nil)
         } catch {
             reply("\(error)")
         }
+    }
+
+    public func secrets(reply: @escaping (Data?, String?) -> Void) {
+        do {
+            let asking = NSXPCConnection.current()?.effectiveUserIdentifier
+            let handed = try lock.withLock { try RestoreService.handOver(secrets, of: current, to: asking) }
+            reply(try JSONEncoder().encode(handed), nil)
+        } catch {
+            reply(nil, "\(error)")
+        }
+    }
+
+    /// The secrets of the restore in `state` for the app of the user `asking`: only once the
+    /// restored folder is their home folder, and only to them.
+    static func handOver(_ secrets: RestoreSecrets?, of state: RestoreState?, to asking: uid_t?) throws -> RestoreSecrets {
+        guard let state, state.phase == .done else { throw Failure(description: "No restored home folder is in place.") }
+        guard asking == state.uid else { throw Failure(description: "This restore is \(state.user)'s.") }
+        guard let secrets else {
+            throw Failure(description: "The restore helper no longer has the token and the key: the Mac restarted after the restore.")
+        }
+        return secrets
     }
 
     // MARK: - The swap
@@ -210,8 +291,7 @@ public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProto
         while let state = lock.withLock({ current }), state.phase == .waitingForLogout {
             if !HomeRestore.isLoggedIn(state.user), HomeRestore.endBackgroundSession(uid: state.uid), !HomeRestore.isLoggedIn(state.user) {
                 do {
-                    try HomeRestore.swap(home: URL(fileURLWithPath: state.home), restored: URL(fileURLWithPath: state.restored),
-                                         aside: URL(fileURLWithPath: state.aside))
+                    try HomeRestore.swap(state.places)
                     log.notice("the restored home folder of uid \(state.uid) is in place")
                     update { $0.phase = .done }
                 } catch {
@@ -230,9 +310,18 @@ public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProto
         guard let data = try? Data(contentsOf: RestoreService.stateFile),
               var state = try? JSONDecoder.iso8601.decode(RestoreState.self, from: data) else { return }
         if state.phase == .restoring {
-            removeRestored(URL(fileURLWithPath: state.restored))
+            HomeRestore.discard(state.places)
             state.phase = .failed
             state.message = "The Mac restarted while the home folder was being restored. Start the restore again."
+        } else if state.phase == .waitingForLogout, !exists(state.places.restored) {
+            // Up to 0.5.0 the restored folder lay next to the home folder, where its owner
+            // could change it all the while. Such a one is not put in place, nor removed by root.
+            let before = state.home + ".restored"
+            state.phase = .failed
+            state.message = exists(URL(fileURLWithPath: before))
+                ? "This version does not finish a restore that an earlier one began. Have an administrator remove \(before) "
+                    + "(sudo rm -rf in Terminal), then start the restore again."
+                : "The restored folder is no longer there. Start the restore again."
         }
         lock.withLock { current = state; save() }
         if state.phase == .waitingForLogout { DispatchQueue.global().async { self.waitForLogout() } }
@@ -243,16 +332,29 @@ public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProto
             guard var state = current else { return }
             change(&state)
             current = state
+            // A restore that failed has nothing to hand over.
+            if state.phase == .failed { secrets = nil }
             save()
         }
     }
 
     /// With the lock held.
     private func save() {
+        guard let current else { try? FileManager.default.removeItem(at: RestoreService.stateFile); return }
         let folder = RestoreService.stateFile.deletingLastPathComponent()
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        guard let current else { try? FileManager.default.removeItem(at: RestoreService.stateFile); return }
         try? JSONEncoder.iso8601.encode(current).write(to: RestoreService.stateFile, options: .atomic)
+    }
+
+    /// With the lock held: the restore is over, and nothing of it stays with the daemon or on
+    /// the Mac, which the app takes the daemon from next. The folder goes only when the state
+    /// was all that is in it.
+    private func forget() {
+        current = nil
+        secrets = nil
+        try? FileManager.default.removeItem(at: RestoreService.stateFile)
+        rmdir(RestoreService.stateFile.deletingLastPathComponent().path)
+        RestoreService.removeRight()
     }
 
     // MARK: - Checks
@@ -265,19 +367,14 @@ public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProto
         return try HomeRestore.account(String(cString: entry.pointee.pw_name))
     }
 
-    /// What has to hold before anything is restored.
+    /// What has to hold before anything is restored: what `restore-home` asks for too, and
+    /// Full Disk Access, which there the swap finds missing.
     static func preflight(_ state: RestoreState, size: Int64?) throws {
-        for path in [state.restored, state.aside] where FileManager.default.fileExists(atPath: path) {
-            throw Failure(description: "\(path) is there already, from an earlier restore. Move it out of the way first.")
-        }
         // Without Full Disk Access macOS does not let even root into a home folder, nor move it.
         guard opendir(state.home + "/Documents").map({ closedir($0); return true }) ?? (errno == ENOENT) else {
             throw Failure(description: "PBS Mackup needs Full Disk Access to put a home folder in place. Turn it on in System Settings, then restore again.")
         }
-        if let size, let free = HomeRestore.freeBytes(at: URL(fileURLWithPath: "/Users")), free < size + size / 10 {
-            throw Failure(description: "The snapshot takes \(ByteCountFormatter.string(fromByteCount: size, countStyle: .file)), "
-                + "and the disk has \(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) free.")
-        }
+        try HomeRestore.preflight(state.places, size: size)
     }
 
     /// The last "progress 22% (...)" in what the client wrote.
@@ -315,6 +412,25 @@ public final class RestoreService: NSObject, NSXPCListenerDelegate, RestoreProto
         defer { AuthorizationFree(reference, []) }
         AuthorizationRightSet(reference, Identity.restoreRight, rightDefinition as CFDictionary,
                               "PBS Mackup wants to restore your home folder from a backup." as CFString, nil, nil)
+    }
+
+    /// Takes `Identity.restoreRight` out of the authorization database again, so that the app
+    /// leaves nothing there once it is uninstalled. A rule an administrator made of it is
+    /// theirs and stays.
+    static func removeRight() {
+        var stored: CFDictionary?
+        guard AuthorizationRightGet(Identity.restoreRight, &stored) == errAuthorizationSuccess,
+              let rule = stored as? [String: Any], isOwnDefinition(rule) else { return }
+        var reference: AuthorizationRef?
+        guard AuthorizationCreate(nil, nil, [], &reference) == errAuthorizationSuccess, let reference else { return }
+        defer { AuthorizationFree(reference, []) }
+        AuthorizationRightRemove(reference, Identity.restoreRight)
+    }
+
+    /// Whether a rule from the authorization database is `rightDefinition` as `defineRight`
+    /// wrote it. The database adds entries of its own, such as when the rule was made.
+    static func isOwnDefinition(_ stored: [String: Any]) -> Bool {
+        rightDefinition.allSatisfy { key, value in (stored[key] as? NSObject)?.isEqual(value) ?? false }
     }
 
     /// Throws unless `external`, the external form of an authorization the app made, has the
