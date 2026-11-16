@@ -138,9 +138,10 @@ public final class Child {
         lock.unlock()
         for (descriptor, data) in pending {
             guard writing, !data.isEmpty else { close(descriptor); continue }
-            // Each on a queue of its own: a program that writes before it reads would wait for
-            // this side to read, while this side waited for it to read.
-            DispatchQueue.global().async {
+            // Each on a thread of its own: a program that writes before it reads would wait for
+            // this side to read, while this side waited for it to read. Not a dispatch queue, whose
+            // threads may all be taken by callers that wait for this very write.
+            Thread {
                 data.withUnsafeBytes { bytes in
                     var sent = 0
                     while sent < bytes.count {
@@ -152,7 +153,7 @@ public final class Child {
                     }
                 }
                 close(descriptor)
-            }
+            }.start()
         }
     }
 
