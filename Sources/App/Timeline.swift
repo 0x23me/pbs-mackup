@@ -391,7 +391,7 @@ final class TimelineModel: ObservableObject {
 struct TimelineView: View {
     @Environment(\.openWindow) private var openWindow
     /// Beta features: whether the Mac Settings layer is on, read when the window opens.
-    @State private var macSettings = false
+    @SwiftUI.State private var macSettings = false
     /// The window's title, which is also how the view knows its own window among the app's.
     static let title = "Backups"
     @StateObject private var model = TimelineModel()
