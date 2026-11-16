@@ -18,10 +18,8 @@ the place to start.
   Back Up Now starts, with none of that; `.helper` is what the app talks to. The helper takes
   messages from the app alone, which macOS checks by the app's signature, and the app talks only
   to a run tool of its own developer.
-- `proxmox-backup-client`, in the app twice: `Contents/Helpers/proxmox-backup-client` does
-  every backup, listing and restore and loads only libraries macOS ships;
-  `Contents/Helpers/proxmox-backup-client-mount` is the same program for Open in Finder, the
-  only one that may load FUSE-T's library. The run tool hands the client the key on standard
+- `proxmox-backup-client`, in `Contents/Helpers`: does every backup, listing and restore and
+  loads only libraries macOS ships. The run tool hands the client the key on standard
   input and the token on a descriptor of its own, so neither shows in its arguments or its
   environment, and a release build first checks that it is the client the app's developer
   signed.
@@ -34,7 +32,7 @@ the place to start.
 | `~/Library/Application Support/pbs-mackup/state.json` | what happened and what is happening, see below |
 | `~/Library/Application Support/pbs-mackup/paused` | an empty file that is there while automatic backups are paused; the app makes and removes it, the run tool only looks for it |
 | `~/Library/Application Support/pbs-mackup/logs/` | one log per run, kept for 30 days |
-| `~/Library/Caches/pbs-mackup/` | the run lock, the backups opened in Finder (`browse`), the files opened from a backup to look at (`preview`, removed when the Backups window closes and when the app quits or starts), the names in the snapshots that were searched (`index`, removed two weeks after the last use), the last measurement of each backed-up folder (`sizes`, folder names and sizes), and during a run the list of changed folders (`changed-folders`), a marker file for the change log (`changes`) and the settings manifest (`settings.json`, see below) |
+| `~/Library/Caches/pbs-mackup/` | the run lock, the files opened from a backup to look at (`preview`, removed when the Backups window closes and when the app quits or starts), the names in the snapshots that were searched (`index`, removed two weeks after the last use), the last measurement of each backed-up folder (`sizes`, folder names and sizes), and during a run the list of changed folders (`changed-folders`), a marker file for the change log (`changes`) and the settings manifest (`settings.json`, see below) |
 | `~/Library/Group Containers/<Team ID>.<bundle identifier>/` | what no other program is to read or write. macOS asks the owner before it lets a program of another developer into this folder. `mnt` is where a run mounts its APFS snapshot, with its copy of Mail, Messages and the like; `check-…` holds the files a run restores to compare them, `key-…` a new or imported key on its way into the Keychain, both only for a moment. `seal.json` is what the app and the run tool last stored themselves, as two digests: of the configuration and of the encryption key. An app built without a developer's identity has no such folder: it keeps the seal with `config.json` and the rest in the cache, where they are open to every program of the user |
 | login Keychain, service `<bundle identifier>.tool` | the API token secret (`token`) and the encryption key (`encryption-key`). The Keychain hands them to the run tool, which signs under that name. Versions before 0.2 kept them under the bundle identifier itself; 0.2 moves them when the app first starts, and macOS asks for the login password for each |
 
@@ -115,20 +113,15 @@ pbs-mackup-run list <snapshot> me.pxar [<folder>]
 pbs-mackup-run versions me.pxar <path>
 pbs-mackup-run restore <snapshot> me.pxar <path> <target folder> [keep-both|replace|skip]
 pbs-mackup-run index <snapshot> me.pxar
-pbs-mackup-run mount <snapshot> me.pxar
-pbs-mackup-run unmount
 pbs-mackup-run sizes <folder>
 pbs-mackup-run settings <snapshot>
 ```
 
 Started this way, and not by the app, the tool asks for Touch ID or the login password before
-it does any of these but `unmount` and `sizes`: any program of yours can start it, and it is
+it does any of these but `sizes`: any program of yours can start it, and it is
 the one the Keychain hands the token and the key to.
 
-`settings` prints the settings manifest of a snapshot (see below). `index` writes the names in a snapshot to a JSON file in the cache, `mount` needs FUSE-T and
-prints the folder; it refuses when `/usr/local/lib/libfuse3.4.dylib`, `/usr/local/bin/go-nfsv4`
-or a folder on the way to them does not belong to root or can be written by others. `unmount`
-takes everything mounted this way. A snapshot is named
+`settings` prints the settings manifest of a snapshot (see below). `index` writes the names in a snapshot to a JSON file in the cache. A snapshot is named
 `host/<id>/2026-11-12T08:00:00Z` and an archive `<folder>.pxar`; anything else is refused.
 
 Without an argument it does one scheduled run, `--manual` one that ignores the interval and

@@ -54,8 +54,6 @@ public enum Paths {
         _ = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
         return home.appendingPathComponent("Library/Group Containers/\(group)")
     }
-    /// Where archives of snapshots are mounted for Finder, one folder each.
-    public static var browse: URL { cache.appendingPathComponent("browse") }
     /// The names in the snapshots that were searched, one file each.
     public static var index: URL { cache.appendingPathComponent("index") }
     /// How big the backed-up folders are, one file each, from the last time they were measured.
@@ -81,8 +79,8 @@ public enum Paths {
 }
 
 /// The app's bundle identifier, from which the other names are made: the run tool signs as
-/// that plus `.tool`, which is also the Keychain service, the clients as `.client` and
-/// `.client-mount`, and the launchd jobs are `.scheduled`, `.manual` and `.helper`. The run tool sits
+/// that plus `.tool`, which is also the Keychain service, the client as `.client`, and the
+/// launchd jobs are `.scheduled`, `.manual` and `.helper`. The run tool sits
 /// inside the app, so both read the identifier from the bundle and the build script is the one
 /// place that names it. Outside a bundle (a development build, the tests) it is the identifier
 /// the build script uses when none is given.

@@ -101,15 +101,6 @@ import Testing
     #expect(Client.archives(in: files) == ["Documents.pxar", "Downloads.pxar"])
 }
 
-@Test func mountFoldersSayWhatTheyShow() {
-    let folder = Client.mountFolder(snapshot: "host/my-mac/2026-11-12T14:00:05Z", archive: "Downloads.pxar")
-    #expect(folder.lastPathComponent == "Downloads 2026-11-12 14.00.05")
-    #expect(folder.deletingLastPathComponent().lastPathComponent == "browse")
-    #expect(!Client.isMounted(FileManager.default.temporaryDirectory.appendingPathComponent("pbs-mackup-not-there")))
-    #expect(!Client.isMounted(URL(fileURLWithPath: NSHomeDirectory())))
-    #expect(Client.isMounted(URL(fileURLWithPath: "/dev")))
-}
-
 @Test func searchFindsNamesAndPutsTheBestFirst() {
     func item(_ path: String, _ type: String = "file") -> SnapshotIndex.Item {
         .init(archive: "Downloads.pxar", path: path, type: type, mtime: 0, size: 1)

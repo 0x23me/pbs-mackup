@@ -16,8 +16,7 @@ this, restore. Not a Proxmox product; if something breaks, open an issue [here](
 - After the first run it reads only the folders macOS reports as changed.
 - Restores a few files from each new snapshot and compares them with the originals.
 - Shows your home folder largest first, so you can untick what you don't need.
-- Browse and search snapshots, see a file's versions, restore. With
-  [FUSE-T](https://www.fuse-t.org), open a snapshot in Finder.
+- Browse and search snapshots, see a file's versions, restore.
 
 Caches, the Trash, files that only exist in iCloud and anything excluded from Time Machine
 are left out.
@@ -103,13 +102,6 @@ to move them there. Back Up Now, the Backups window and the settings work as bef
 The Backups window has snapshots on the left and folders on the right. Restore an item to a
 folder you pick or to where it was; if something is already there you are asked first.
 Right-click a file for its versions. Command-F searches the names of the whole snapshot.
-
-Open in Finder needs FUSE-T (`brew install --cask fuse-t`). A mounted backup shows no Mac
-metadata, so restore files rather than copying them out. While it is open, any program can read
-it, and FUSE-T serves it through an NFS server on this Mac that this app has not looked into. It
-is refused when FUSE-T's files in `/usr/local` or a folder above them can be changed by anyone
-but root, as on an Intel Mac where Homebrew owns `/usr/local/lib`: what is loaded from there
-runs with the token and the key.
 
 ### After losing the Mac
 
@@ -233,8 +225,7 @@ Files and settings: [docs/reference.md](docs/reference.md). Building it:
   delete the token and the key from the Keychain, or rewrite the state file. Backups then stop
   or fail and the menu says so; nothing gets out.
 - Not what you are looking at: a file opened from the Backups window is an ordinary copy in the
-  cache until the window closes, and a backup opened in Finder can be read by any program
-  while it is open.
+  cache until the window closes.
 - Not from the versions before 0.2 as long as their Keychain items exist: those handed the key
   to whoever asked. 0.2 moves the items out of their reach when it first starts. If an earlier
   version ran on a Mac you don't trust, make a new key.

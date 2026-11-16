@@ -181,88 +181,38 @@ func theInstalledClientIsSignedByTheTeamOfTheInstalledRunTool() throws {
 @Test func theOrdinaryClientMayNotLoadOtherDevelopersLibraries() throws {
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("pbs-mackup-entitled-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: folder) }
-    // One program twice under one name, as the app holds its client: once plain, and once
-    // signed like the copy for `mount`, with the entitlements the build gives that copy.
-    let entitlements = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-        .appendingPathComponent("Scripts/client.entitlements")
+    // One program twice under one name: once plain, and once with the entitlement that lets it
+    // load other developers' libraries, as the clients of releases up to 0.4 had.
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let entitlements = folder.appendingPathComponent("foreign.entitlements")
+    try Data("""
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict><key>com.apple.security.cs.disable-library-validation</key><true/></dict></plist>
+        """.utf8).write(to: entitlements)
     func copy(in name: String, _ options: [String] = []) throws -> URL {
         let copy = try adHocCopy(of: "/bin/sleep", in: folder.appendingPathComponent(name))
         let signed = tool("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier", "pbs-mackup-test-client"] + options + [copy.path])
         try #require(signed.status == 0, "\(signed.output)")
         return copy
     }
-    let plain = try copy(in: "plain"), mounting = try copy(in: "mount", ["--entitlements", entitlements.path])
+    let plain = try copy(in: "plain"), foreign = try copy(in: "foreign", ["--entitlements", entitlements.path])
     // The name stands in for the team, which a signature anyone can make does not have.
     let named = try #require(Signature.requirement("identifier \"pbs-mackup-test-client\""))
     let ordinary = try #require(Signature.withoutForeignLibraries(named))
     #expect(Signature.isSigned(plain, as: named) && Signature.isSigned(plain, as: ordinary))
-    #expect(Signature.isSigned(mounting, as: named))            // good for `mount`,
-    #expect(!Signature.isSigned(mounting, as: ordinary))        // and for nothing else
+    #expect(Signature.isSigned(foreign, as: named))
+    #expect(!Signature.isSigned(foreign, as: ordinary))
     #expect(!Signature.isSigned(URL(fileURLWithPath: "/bin/sleep"), as: ordinary))     // the name is still asked for
 
     // The same of what runs.
-    for (program, passes) in [(plain, true), (mounting, false)] {
+    for (program, passes) in [(plain, true), (foreign, false)] {
         let running = try Child(program, ["30"])
         defer { running.signal(SIGKILL); running.wait() }
         let code = try #require(Signature.running(running.pid))
         #expect(Signature.isSigned(code, as: named))
         #expect(Signature.isSigned(code, as: ordinary) == passes)
     }
-}
-
-/// What `mount` loads into a client that holds the token and the key has to be the system's
-/// alone to change. In a folder of the test's own, where the test's user stands in for root.
-@Test func whatAMountLoadsHasToBeTheSystemsAloneToChange() throws {
-    // Named without the link that the way to the temporary folder goes through.
-    let base = URL(fileURLWithPath: Config.realPath(NSTemporaryDirectory())).appendingPathComponent("pbs-mackup-fuse-\(UUID().uuidString)")
-    defer { try? FileManager.default.removeItem(at: base) }
-    func path(_ name: String) -> String { base.path + "/" + name }
-    func mode(_ mode: Int, _ name: String) throws { try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: path(name)) }
-    for folder in ["lib", "bin", "elsewhere/bin"] {
-        try FileManager.default.createDirectory(atPath: path(folder), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o755])
-    }
-    for file in ["lib/library", "elsewhere/bin/helper-1.2"] {
-        try Data("x".utf8).write(to: URL(fileURLWithPath: path(file)))
-        try mode(0o755, file)
-    }
-    // As FUSE-T installs its helper: a link in one folder to a file in another.
-    try FileManager.default.createSymbolicLink(atPath: path("bin/helper"), withDestinationPath: "../elsewhere/bin/helper-1.2")
-    /// What could be exchanged on the way to `name`, named from the test's folder on.
-    func exchangeable(_ name: String) -> String? {
-        Client.exchangeable(path(name), owners: [0, getuid()]).map { String($0.dropFirst(base.path.count)) }
-    }
-
-    #expect(exchangeable("lib/library") == nil)
-    #expect(exchangeable("bin/helper") == nil)
-    #expect(exchangeable("bin/not-there") == nil)                // nobody else can make it there either
-    // With root alone to be trusted, as `mount` asks, the first folder of the user's on the way is named.
-    let first = try #require(Client.exchangeable(path("lib/library")))
-    #expect(base.path.hasPrefix(first) && first != "/")
-
-    // A file, the folder it is in, a folder above: each open to the group or to everyone.
-    try mode(0o775, "lib/library")
-    #expect(exchangeable("lib/library") == "/lib/library")
-    try mode(0o755, "lib/library")
-    try mode(0o757, "lib")
-    #expect(exchangeable("lib/library") == "/lib")
-    try mode(0o755, "lib")
-    // Where a link leads counts like the way to the link: the helper's own folder, as
-    // Homebrew leaves /usr/local/bin on an Intel Mac, and the folder the link points into.
-    try mode(0o775, "bin")
-    #expect(exchangeable("bin/helper") == "/bin")
-    try mode(0o755, "bin")
-    try mode(0o775, "elsewhere")
-    #expect(exchangeable("bin/helper") == "/elsewhere")
-    try mode(0o755, "elsewhere")
-    try mode(0o777, "elsewhere/bin/helper-1.2")
-    #expect(exchangeable("bin/helper") == "/elsewhere/bin/helper-1.2")
-    try mode(0o755, "elsewhere/bin/helper-1.2")
-    #expect(exchangeable("bin/helper") == nil)
-    // A link that leads round in a circle leads nowhere good.
-    try FileManager.default.createSymbolicLink(atPath: path("bin/round"), withDestinationPath: "round")
-    #expect(exchangeable("bin/round") == "/bin/round")
-
-    #expect(Client.fuseTExchangeable("/usr/local/lib").contains("/usr/local/lib does not belong to the system alone"))
 }
 
 extension PrivateHomeTests {
@@ -274,7 +224,7 @@ extension PrivateHomeTests {
     let client = try Client(config: home.config)
     let arguments = ["catalog", "list", snapshot, "Downloads.pxar", "/"]
     func start(usesKey: Bool = true, signedAs requirement: SecRequirement?) throws -> Child {
-        try client.start(arguments, usesKey: usesKey, executable: client.executable, signedAs: requirement)
+        try client.start(arguments, usesKey: usesKey, signedAs: requirement)
     }
 
     // The stand-in is a script nobody signed: asked for a team's client, it is not started.
@@ -363,28 +313,6 @@ extension PrivateHomeTests {
     #expect(home.noted("input") == "KEY")
 }
 
-@Test func mountingUsesItsOwnCopyOfTheClientWhereThereIsOne() throws {
-    let home = try Home()
-    defer { home.remove() }
-    try Keychain.set(.token, Data("right-token".utf8))
-    try Keychain.set(.encryptionKey, Data("KEY".utf8))
-    let client = try Client(config: home.config)
-    #expect(client.mountExecutable.path == client.executable.path)   // a development build has one client
-    let copy = client.executable.deletingLastPathComponent().appendingPathComponent("proxmox-backup-client-mount")
-    try FileManager.default.copyItem(at: client.executable, to: copy)
-    #expect(client.mountExecutable.path == copy.path)
-
-    // Everything but `mount` still runs the first one.
-    try client.checkConnection()
-    #expect(home.noted("program") == client.executable.path + "\n")
-    if Client.canMount, Client.fuseT.allSatisfy({ Client.exchangeable($0) == nil }) {
-        // The stand-in mounts nothing, which is an error, but it was the copy that was asked.
-        #expect(failure { _ = try client.mount(snapshot: snapshot, archive: "Downloads.pxar") } == "The backup could not be mounted.")
-        #expect(home.noted("program") == copy.path + "\n")
-        #expect(home.noted("input") == "KEY")
-    }
-}
-
 @Test func whatTheServerListsUnderAnotherNameIsLeftOut() throws {
     let home = try Home()
     defer { home.remove() }
@@ -417,7 +345,6 @@ extension PrivateHomeTests {
     #expect(failure { _ = try client.versions(archive: "../x.pxar", path: "a") } != nil)
     #expect(failure { _ = try client.index(snapshot: "host/../../x/2026-11-12T14:00:05Z", archives: ["Downloads.pxar"]) } != nil)
     #expect(failure { _ = try client.index(snapshot: snapshot, archives: ["Downloads.pxar", "../x.pxar"]) } != nil)
-    #expect(failure { _ = try client.mount(snapshot: snapshot, archive: "../x.pxar") }?.contains("is not an archive") == true)
     #expect(home.noted("arguments") == nil)                          // the client was never started,
     #expect(!FileManager.default.fileExists(atPath: Paths.cache.path))   // and nothing was made in the cache
 

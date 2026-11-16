@@ -153,13 +153,6 @@ let commands: [Command] = [
                 try json(["index": Client(config: config).index(snapshot: call.arguments[1],
                                                                 archives: Array(call.arguments.dropFirst(2))).path])
             }),
-    Command(name: "mount", arguments: "<snapshot> <archive>", count: 2...2,
-            what: "show an archive as a read-only folder (needs FUSE-T)", confirm: "open a backup as a folder",
-            run: .configured { call, config in
-                try json(["mounted": Client(config: config).mount(snapshot: call.arguments[1], archive: call.arguments[2]).path])
-            }),
-    Command(name: "unmount", what: "unmount every such folder",
-            run: .plain { _ in try json(["stillInUse": Client.unmount().map(\.path)]) }),
     Command(name: "sizes", arguments: "<folder>", count: 1...1,
             what: "measure a folder and what is in it, for choosing what to leave out; prints the file",
             run: .plain { call in try json(["sizes": FolderSizes.measure(call.arguments[1]).save().path]) }),

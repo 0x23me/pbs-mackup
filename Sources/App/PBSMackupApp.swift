@@ -106,12 +106,10 @@ final class StatusModel: ObservableObject {
     private var timer: Timer?
 
     init() {
-        // Files opened from a backup to look at and backups opened in Finder that a previous run
-        // of the app left behind, e.g. after a crash; and on quitting, the ones of this run.
+        // Files opened from a backup to look at that a previous run of the app left behind, e.g.
+        // after a crash; and on quitting, the ones of this run.
         Paths.emptyPreview()
-        DispatchQueue.global().async { Client.unmount() }
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
-            Client.unmount()
             Paths.emptyPreview()
         }
         #if DEBUG

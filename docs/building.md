@@ -8,7 +8,7 @@ git clone --recurse-submodules -b pbs-mackup https://github.com/0x23me/proxmox-b
 cd ../proxmox-backup-macos && git checkout "$(cat ../pbs-mackup/client.commit)" && just build
 ```
 
-The client's build needs Rust, Homebrew's `openssl@3`, `zstd` and `pkgconf`, and FUSE-T; its
+The client's build needs Rust and Homebrew's `openssl@3`, `zstd` and `pkgconf`; its
 `README.macos.md` has the details. OpenSSL and zstd are linked into the client, so the app
 runs on a Mac without Homebrew. It then needs the macOS version Homebrew built them for,
 which is why the app asks for macOS 26.
@@ -28,21 +28,19 @@ and every pull request (`.github/workflows/test.yml`); they need no client and n
 `Package.swift` asks for the same macOS version as the app.
 
 `just bundle` needs a "Developer ID Application" signing identity (`PBS_MACKUP_SIGN_IDENTITY`
-overrides it) and the client built in `../proxmox-backup-macos` with `just build` (which needs
-FUSE-T installed; the built app runs without it), from exactly
+overrides it) and the client built in `../proxmox-backup-macos` with `just build`, from exactly
 the commit named in `client.commit`. To move to a newer client, check it out there, build it,
 and put its commit into `client.commit`. `PBS_MACKUP_CLIENT` names another client binary and
 skips that check.
 
-The bundle holds the client twice. The first copy loses its library search path
-(`/usr/local/lib`); the second keeps it and is only used for `mount`. Only that second copy is
-signed with the entitlement in `Scripts/client.entitlements`, which lets it load FUSE-T's
-library; the run tool of a release build does not start a `proxmox-backup-client` that has it.
-Signed with a developer's identity, the app, `pbs-mackup-run` and both clients get the
+`bundle.sh` refuses a client that loads a library macOS does not ship or has a library search
+path, and nothing in the bundle may load another developer's library; the run tool of a release
+build does not start a `proxmox-backup-client` that may.
+Signed with a developer's identity, the app, `pbs-mackup-run` and the client get the
 entitlement `com.apple.security.application-groups` for `<Team ID>.<bundle identifier>`, which
 `bundle.sh` writes from the Team ID in the signature. A release build starts only a client
 signed by the same team as `pbs-mackup-run` and under the client's own identifier
-(`<bundle identifier>.client`, for `mount` `.client-mount`), and checks the started client again
+(`<bundle identifier>.client`), and checks the started client again
 before it hands over the key.
 
 `pbs-mackup-run` is signed as `<bundle identifier>.tool`, and that name is a promise. The

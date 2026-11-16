@@ -64,7 +64,6 @@ jobs:
       - name: Install the client's build dependencies
         run: |
           brew install openssl@3 zstd pkgconf
-          brew install --cask fuse-t
 
       # OpenSSL and zstd come as Homebrew has them that day and are linked into the client, and
       # the compilers are the runner's: what went into this release is written down with it.
@@ -78,7 +77,6 @@ jobs:
             rustc --version
             cargo --version
             brew list --versions openssl@3 zstd pkgconf
-            brew list --cask --versions fuse-t
           } | tee pbs-mackup/dist/built-with.txt
 
       - name: Build the client

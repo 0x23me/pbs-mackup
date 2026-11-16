@@ -72,13 +72,6 @@ public struct Client {
         #endif
     }
 
-    /// The client for `mount`: a second copy next to the first, the only one that may load
-    /// FUSE-T's library. Where there is none (a development build) it is the client itself.
-    var mountExecutable: URL {
-        let copy = executable.deletingLastPathComponent().appendingPathComponent("proxmox-backup-client-mount")
-        return FileManager.default.isExecutableFile(atPath: copy.path) ? copy : executable
-    }
-
     /// What every client starts with, built from scratch: no variable the tool inherited is
     /// handed on to the client, where it could name another server or a proxy, other trusted
     /// roots, or a command to run. The home folder, the user and the temporary folder are the
@@ -104,25 +97,23 @@ public struct Client {
     /// command takes a key). With `mergingErrors` its standard error arrives with its standard
     /// output. A release build only starts a client of its own developer.
     public func start(_ arguments: [String], usesKey: Bool = true, mergingErrors: Bool = false) throws -> Child {
-        try start(arguments, usesKey: usesKey, mergingErrors: mergingErrors, executable: executable, signedAs: Client.requirement())
+        try start(arguments, usesKey: usesKey, mergingErrors: mergingErrors, signedAs: Client.requirement())
     }
 
     /// What a client has to meet: signed by the developer who signed this program, as the
-    /// client (the developer's other programs are not clients) and, unless it is the copy for
-    /// `mount`, not allowed to load libraries of other developers. That copy is, for FUSE-T's
-    /// library, and so was the only client of earlier versions of the app: put in the place
-    /// of today's, either would do every backup with whatever library lies where it looks for
-    /// one. Nil when nothing is asked, which is in a development build (it runs stand-in
-    /// clients) and in a build no developer signed.
-    static func requirement(mounting: Bool = false) throws -> SecRequirement? {
+    /// client (the developer's other programs are not clients), and not allowed to load
+    /// libraries of other developers. The clients of releases up to 0.4 were, for FUSE-T's
+    /// library: put in the place of today's, one would do every backup with whatever library
+    /// lies where it looks for one. Nil when nothing is asked, which is in a development build
+    /// (it runs stand-in clients) and in a build no developer signed.
+    static func requirement() throws -> SecRequirement? {
         #if DEBUG
         return nil
         #else
         switch Signature.own {
         case .team(let team):
-            let identifier = Identity.bundleID + (mounting ? ".client-mount" : ".client")
-            if let signed = Signature.requirement(team: team, identifier: identifier),
-               let requirement = mounting ? signed : Signature.withoutForeignLibraries(signed) { return requirement }
+            if let signed = Signature.requirement(team: team, identifier: Identity.bundleID + ".client"),
+               let requirement = Signature.withoutForeignLibraries(signed) { return requirement }
         case .nobody:
             return nil
         case .unknown:
@@ -154,7 +145,7 @@ public struct Client {
     /// and the started program has to meet it before it gets the token and the key: the file
     /// can be exchanged in between, what runs cannot. Until then the client has neither, so
     /// the token is as safe as the key.
-    func start(_ arguments: [String], usesKey: Bool = true, mergingErrors: Bool = false, executable: URL,
+    func start(_ arguments: [String], usesKey: Bool = true, mergingErrors: Bool = false,
                signedAs requirement: SecRequirement?) throws -> Child {
         if let requirement, !Signature.isSigned(executable, as: requirement) {
             throw Failure(description: "\(executable.path) is not signed the way this app's developer signs its client, so it was not started. Install the app again.")

@@ -61,7 +61,6 @@ cask "pbs-mackup" do
 
   caveats <<~EOS
     Switch on Full Disk Access for PBS Mackup in System Settings.
-    Open in Finder needs FUSE-T: brew install --cask fuse-t
   EOS
 end
 CASK

@@ -278,31 +278,6 @@ final class TimelineModel: ObservableObject {
         return (answer, alert.suppressionButton?.state == .on)
     }
 
-    /// Shows the open folder of the selected snapshot in Finder, read-only. Without FUSE-T it
-    /// says what is needed; everything else in this window works without it.
-    func openInFinder() async {
-        guard let snapshot, let archive else { return }
-        guard Client.canMount else {
-            let alert = NSAlert()
-            alert.messageText = "Open in Finder needs FUSE-T"
-            alert.informativeText = Client.fuseTNeeded
-            alert.addButton(withTitle: "OK")
-            alert.addButton(withTitle: "Open fuse-t.org")
-            if alert.runModal() == .alertSecondButtonReturn, let page = URL(string: "https://www.fuse-t.org") {
-                NSWorkspace.shared.open(page)
-            }
-            return
-        }
-        struct Mounted: Decodable { let mounted: String }
-        await work {
-            message = "Opening the backup in Finder…"
-            let root = URL(fileURLWithPath: try await RunTool.decode(Mounted.self, ["mount", snapshot.name, archive]).mounted)
-            NSWorkspace.shared.open(path.reduce(root) { $0.appendingPathComponent($1) })
-            message = "Opened read-only in Finder, as of \(snapshot.time.formatted(date: .abbreviated, time: .shortened)). "
-                + "It goes away when this window closes."
-        }
-    }
-
     /// To the enclosing folder; out of the search results, back to the folder that was open.
     func up() async {
         if searching { endSearch(); return }
@@ -398,13 +373,9 @@ struct TimelineView: View {
 
     private static func isOwn(_ note: Notification) -> Bool { (note.object as? NSWindow)?.title == title }
 
-    /// What Open in Finder mounted and the files opened to look at live as long as this window
-    /// (and the app, see StatusModel).
+    /// The files opened to look at live as long as this window (and the app, see StatusModel).
     private static func takeDown() {
-        DispatchQueue.global().async {
-            Client.unmount()
-            Paths.emptyPreview()
-        }
+        DispatchQueue.global().async { Paths.emptyPreview() }
     }
 
     var body: some View {
@@ -436,8 +407,6 @@ struct TimelineView: View {
                         .help("The settings recorded with this backup outside its files: the apps that opened at login")
                         Divider().frame(height: 16)
                     }
-                    Button("Open in Finder") { Task { await model.openInFinder() } }
-                        .disabled(model.archive == nil || model.searching || model.busy)
                     Button("Restore to Original Location") { Task { await model.restoreSelection(toOriginal: true) } }
                         .disabled(!model.canRestore(model.selection) || model.busy)
                     Button("Restore…") { Task { await model.restoreSelection() } }

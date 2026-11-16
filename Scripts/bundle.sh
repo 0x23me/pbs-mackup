@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Builds and signs .build/PBSMackup.app: the menu bar app, the run tool, the launchd jobs and the
-# client, twice. The client is the one built in a checkout of the fork next to this one
+# client. The client is the one built in a checkout of the fork next to this one
 # (../proxmox-backup-macos), from exactly the commit in client.commit; PBS_MACKUP_CLIENT names another
 # binary and skips that check.
 #
 #   PBS_MACKUP_SIGN_IDENTITY   signing identity, "Developer ID Application" when not set
-#   PBS_MACKUP_BUNDLE_ID       bundle identifier; the run tool, the clients, the Keychain service and the
+#   PBS_MACKUP_BUNDLE_ID       bundle identifier; the run tool, the client, the Keychain service and the
 #                              launchd jobs are named after it
 #   PBS_MACKUP_VERSION         version, the content of VERSION when not set
 set -euo pipefail
@@ -24,10 +24,11 @@ if [ -z "${PBS_MACKUP_CLIENT:-}" ]; then
         exit 1
     }
 fi
-# The app has to run on a Mac without Homebrew: the client may load what macOS ships and,
-# when it is there, FUSE-T's library, nothing else.
-foreign="$(otool -L "$client" | tail -n +2 | awk '{print $1}' | grep -v -e '^/usr/lib/' -e '^/System/' -e '^@rpath/libfuse3' || true)"
+# The app has to run on a Mac without Homebrew: the client may load what macOS ships, nothing
+# else, and has no folder to look for libraries in.
+foreign="$(otool -L "$client" | tail -n +2 | awk '{print $1}' | grep -v -e '^/usr/lib/' -e '^/System/' || true)"
 [ -z "$foreign" ] || { echo "the client loads libraries a Mac does not have by itself:" >&2; echo "$foreign" >&2; exit 1; }
+! otool -l "$client" | grep -q LC_RPATH || { echo "the client has a library search path" >&2; exit 1; }
 
 swift build -c release
 bin="$(swift build -c release --show-bin-path)"
@@ -35,15 +36,8 @@ app=".build/PBSMackup.app"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Helpers" "$app/Contents/Resources" "$app/Contents/Library/LaunchAgents" "$app/Contents/Library/LaunchDaemons"
 cp "$bin/PBSMackup" "$bin/pbs-mackup-run" "$app/Contents/MacOS/"
-# The client is there twice. The first does every backup, listing and restore. It has no folder
-# to look for FUSE-T's library in, so it loads nothing but what macOS ships. The second is only
-# for "Open in Finder", which needs that library.
 helpers="$app/Contents/Helpers"
 cp "$client" "$helpers/proxmox-backup-client"
-cp "$client" "$helpers/proxmox-backup-client-mount"
-otool -l "$client" | awk '$1 == "cmd" { rpath = $2 == "LC_RPATH" } rpath && $1 == "path" { print $2 }' | while read -r folder; do
-    install_name_tool -delete_rpath "$folder" "$helpers/proxmox-backup-client"
-done
 cp Resources/AppIcon.icns "$app/Contents/Resources/"
 cp LICENSE THIRD_PARTY.md "$app/Contents/Resources/"
 
@@ -149,34 +143,28 @@ codesign --force --sign "$identity" "$helpers/proxmox-backup-client"
 team="$(codesign -dv "$helpers/proxmox-backup-client" 2>&1 | sed -n 's/^TeamIdentifier=\([A-Z0-9]*\)$/\1/p')"
 groups=""
 group=""
-mount="--entitlements Scripts/client.entitlements"
 if [ -n "$team" ]; then
     groups="<key>com.apple.security.application-groups</key><array><string>${team}.${id}</string></array>"
     group="--entitlements .build/groups.entitlements"
-    mount="--entitlements .build/mount.entitlements"
 fi
-for name in groups mount app; do
-    library=""
-    [ "$name" = mount ] && library="<key>com.apple.security.cs.disable-library-validation</key><true/>"
+for name in groups app; do
+    events=""
     # The app sends Apple events: Log Out at the end of a restore, to loginwindow, and login items, to
     # System Events. The run tool reads login items too; macOS counts it as the app's, so it needs no entitlement.
-    [ "$name" = app ] && library="<key>com.apple.security.automation.apple-events</key><true/>"
+    [ "$name" = app ] && events="<key>com.apple.security.automation.apple-events</key><true/>"
     cat > ".build/$name.entitlements" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   ${groups}
-  ${library}
+  ${events}
 </dict></plist>
 PLIST
 done
 # Everything gets the hardened runtime, which notarization asks for, and with it library
-# validation: macOS lets a program load only libraries of its own developer and Apple's. The
-# client for "Open in Finder" loads FUSE-T's library, which another developer signed, so it
-# alone is exempt (Scripts/client.entitlements says what that exemption is).
-# $group and $mount are two words or none.
+# validation: macOS lets a program load only libraries of its own developer and Apple's.
+# $group is two words or none.
 codesign --force --options runtime --timestamp --sign "$identity" -i "${id}.client" $group "$helpers/proxmox-backup-client"
-codesign --force --options runtime --timestamp --sign "$identity" -i "${id}.client-mount" $mount "$helpers/proxmox-backup-client-mount"
 # The run tool signs as ".tool". The Keychain knows the program that may read the token and the
 # key by this name and the developer, not by its version: every run tool ever released under
 # this name can read them for good. The versions before 0.2 signed as ".run" and handed the key
