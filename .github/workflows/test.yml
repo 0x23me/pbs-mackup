@@ -26,17 +26,17 @@ jobs:
         with:
           persist-credentials: false
       - run: swift build
-      # The tests take seconds. A step that is still running after 8 minutes is stuck, and the
+      # The tests take seconds. A step that is still running after 4 minutes is stuck, and the
       # step after it says where (a stuck run is otherwise only cut off at the end of the job).
       - run: swift test 2>&1 | tee test.log
         shell: bash
-        timeout-minutes: 8
+        timeout-minutes: 4
       - name: Show where a stuck test waits
         if: failure() || cancelled()
         shell: bash
         run: |
           echo "--- last tests started"; grep -E "started\.|passed|failed" test.log | tail -15 || true
-          echo "--- processes"; ps -axo pid,ppid,etime,stat,command | grep -Ev "ps -axo|grep" | tail -40
+          echo "--- processes"; ps -axo pid,ppid,etime,stat,command | grep -E "swift|xctest|proxmox|pbs-mackup|sleep|/bin/sh" | grep -v grep
           for pid in $(pgrep -f "swiftpm-testing-helper|xctest|proxmox-backup-client|pbs-mackup-run" || true); do
-            echo "--- sample $pid"; sample "$pid" 2 -file /dev/stdout 2>&1 | head -60 || true
+            echo "--- sample $pid"; sample "$pid" 2 -file /dev/stdout 2>&1 | grep -vE "deduplicated_symbol|\(in Testing\)|libswift_Concurrency|TaskLocal" | head -120 || true
           done
