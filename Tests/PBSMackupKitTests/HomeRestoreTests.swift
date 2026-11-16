@@ -77,3 +77,29 @@ private let listed = [
     #expect(HomeRestore.hasPrograms(uid: getuid()))
     #expect(!HomeRestore.hasPrograms(uid: 4242))
 }
+
+@Test func restoreProgressIsTheLastPercentTheClientWrote() {
+    let output = Data("Using encryption key from file descriptor..\nprogress 22% (200 MiB of 901 MiB in 5s, 39 MiB/s)\nprogress 57% (514 MiB".utf8)
+    #expect(RestoreService.progress(in: output) == 0.57)
+    #expect(RestoreService.progress(in: Data("restore complete".utf8)) == nil)
+}
+
+@Test func homeRestoreLeavesTheCloudOutAndKeepsTheRest() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent("home-restore-\(UUID().uuidString)")
+    defer { removeRestored(root) }
+    for folder in HomeRestore.cloudFolders + ["Library/Application Support/Notes", "Documents"] {
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(folder), withIntermediateDirectories: true)
+    }
+    let account = HomeRestore.Account(name: NSUserName(), uid: getuid(), home: root)
+    let notes = HomeRestore.adapt(root, to: account)
+    for folder in HomeRestore.cloudFolders {
+        #expect(!FileManager.default.fileExists(atPath: root.appendingPathComponent(folder).path), "\(folder) is left out")
+    }
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Library/Application Support/Notes").path))
+    #expect(FileManager.default.fileExists(atPath: root.appendingPathComponent("Documents").path))
+    #expect(notes.contains { $0.contains("iCloud") })
+}
+
+@Test func homeRestoreSeesWhoIsLoggedIn() {
+    #expect(!HomeRestore.isLoggedIn("nobody-\(UUID().uuidString.prefix(8))"))
+}

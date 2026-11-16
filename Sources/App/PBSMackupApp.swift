@@ -39,6 +39,11 @@ struct PBSMackupApp: App {
             SettingsView()
         }
         .windowResizability(.contentMinSize)
+
+        Window(RestoreModel.title, id: "restore") {
+            RestoreView()
+        }
+        .windowResizability(.contentSize)
     }
 }
 
@@ -50,8 +55,17 @@ private struct MenuBarLabel: View {
         #if DEBUG
         Image(systemName: symbol).onAppear { Shot.take(openWindow) }
         #else
-        Image(systemName: symbol)
+        Image(systemName: symbol).task { await openUnfinishedRestore() }
         #endif
+    }
+
+    /// After the login that follows a restore, or a restore that failed, the restore window
+    /// opens by itself: the owner finishes there, and the restore helper goes away.
+    private func openUnfinishedRestore() async {
+        guard RestoreModel.daemon.status == .enabled, let state = try? await RestoreDaemon.status(),
+              state.phase == .done || state.phase == .failed else { return }
+        openWindow(id: "restore")
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -281,6 +295,10 @@ struct StatusMenu: View {
                 }.disabled(model.status == .notSetUp)
                 MenuRow(title: model.status == .notSetUp ? "Set Up…" : "Settings…", symbol: "gearshape", opens: true) {
                     openWindow(id: "settings")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                MenuRow(title: "\(RestoreModel.title)…", symbol: "arrow.down.doc", opens: true) {
+                    openWindow(id: "restore")
                     NSApp.activate(ignoringOtherApps: true)
                 }
                 MenuRow(title: "Open Log", symbol: "doc.text", opens: true) { model.openLog() }

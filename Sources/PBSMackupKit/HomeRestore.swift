@@ -27,14 +27,17 @@ public enum HomeRestore {
 
     /// Whether any program runs as `uid`: a user who is logged in, also one the Mac only
     /// switched away from, has dozens.
-    public static func hasPrograms(uid: uid_t) -> Bool {
+    public static func hasPrograms(uid: uid_t) -> Bool { !programs(uid: uid).isEmpty }
+
+    /// The process ids of the programs that run as `uid`.
+    static func programs(uid: uid_t) -> [pid_t] {
         var request: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_UID, Int32(bitPattern: uid)]
         var size = 0
-        guard sysctl(&request, 4, nil, &size, nil, 0) == 0, size > 0 else { return false }
+        guard sysctl(&request, 4, nil, &size, nil, 0) == 0, size > 0 else { return [] }
         var found = [kinfo_proc](repeating: kinfo_proc(), count: size / MemoryLayout<kinfo_proc>.stride + 8)
         size = found.count * MemoryLayout<kinfo_proc>.stride
-        guard sysctl(&request, 4, &found, &size, nil, 0) == 0 else { return true }
-        return size / MemoryLayout<kinfo_proc>.stride > 0
+        guard sysctl(&request, 4, &found, &size, nil, 0) == 0 else { return [] }
+        return found.prefix(size / MemoryLayout<kinfo_proc>.stride).map(\.kp_proc.p_pid)
     }
 
     /// The snapshot to restore: `requested` when given, otherwise the newest that holds
@@ -142,6 +145,77 @@ public enum HomeRestore {
         var id = UUID().uuid
         let status = withUnsafeMutableBytes(of: &id) { mbr_uid_to_uuid(uid, $0.baseAddress!.assumingMemoryBound(to: UInt8.self)) }
         return status == 0 ? UUID(uuid: id) : nil
+    }
+
+    /// What a restore leaves out of a home folder: the files of iCloud Drive and of the other
+    /// cloud storage providers, and what macOS knows about their state. Their contents are in
+    /// the cloud and come back once the owner signs in again; an old copy next to an old state
+    /// would leave the provider to sort out which side is right.
+    public static let cloudFolders = ["Library/Mobile Documents", "Library/CloudStorage", "Library/Application Support/CloudDocs",
+                                      "Library/Application Support/FileProvider",
+                                      "Library/Containers/com.apple.CloudDocs.iCloudDriveFileProvider",
+                                      "Library/Containers/com.apple.CloudDocs.iCloudDriveFileProviderManaged"]
+
+    /// What follows the restore and comes before the swap: the owner of this Mac in place of
+    /// the old one, in owners and ACLs, and the cloud folders taken out. Returns what was done,
+    /// as sentences for the owner.
+    public static func adapt(_ restored: URL, to account: Account) -> [String] {
+        var notes: [String] = []
+        var info = stat()
+        if lstat(restored.path, &info) == 0, info.st_uid != account.uid {
+            let reowned = reown(restored, from: info.st_uid, to: account.uid)
+            notes.append("\(reowned.changed.formatted()) files are now owned by your account on this Mac (uid \(info.st_uid) on the old Mac, \(account.uid) here).")
+            if !reowned.failed.isEmpty { notes.append("These still belong to uid \(info.st_uid): \(reowned.failed.prefix(10).joined(separator: ", "))") }
+        }
+        let strangers = strangers(in: restored)
+        if strangers.count == 1, let old = strangers.first, let new = generatedUID(of: account.uid) {
+            let replaced = replaceInACLs(restored, old, with: new)
+            notes.append("Sharing permissions that named you on the old Mac now name your account here (\(replaced.changed) \(replaced.changed == 1 ? "item" : "items")).")
+            if !replaced.failed.isEmpty { notes.append("These ACLs could not be changed: \(replaced.failed.prefix(10).joined(separator: ", "))") }
+        } else if strangers.count > 1 {
+            notes.append("ACLs name \(strangers.count) users or groups this Mac does not know; they were left as they are.")
+        }
+        let cloud = cloudFolders.map { restored.appendingPathComponent($0) }.filter(exists)
+        cloud.forEach(removeRestored)
+        if !cloud.isEmpty { notes.append("iCloud Drive and other cloud storage were left out. They sync again once you sign in.") }
+        return notes
+    }
+
+    /// Whether `name` has a login session: at the Mac, also one it only switched away from, or
+    /// over the network.
+    public static func isLoggedIn(_ name: String) -> Bool {
+        setutxent()
+        defer { endutxent() }
+        while let entry = getutxent() {
+            guard entry.pointee.ut_type == USER_PROCESS else { continue }
+            let user = withUnsafeBytes(of: entry.pointee.ut_user) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+            if user == name { return true }
+        }
+        return false
+    }
+
+    /// Ends what macOS keeps running for a user after they logged out: their launchd domain
+    /// with its background services, some of which keep files in the home folder open (the
+    /// Messages database, for one), and then whatever still runs as them outside it, such as
+    /// system services that work for the user (`languageassetd`): asked to quit, and made to
+    /// after five seconds. Only called once the user has no login session. Returns whether no
+    /// program of theirs is left.
+    public static func endBackgroundSession(uid: uid_t) -> Bool {
+        tool("/bin/launchctl", ["bootout", "user/\(uid)"])
+        if waitUntilGone(uid: uid, seconds: 10) { return true }
+        for signal in [SIGTERM, SIGKILL] {
+            programs(uid: uid).forEach { kill($0, signal) }
+            if waitUntilGone(uid: uid, seconds: 5) { return true }
+        }
+        return false
+    }
+
+    private static func waitUntilGone(uid: uid_t, seconds: Int) -> Bool {
+        for _ in 0..<(seconds * 4) {
+            if !hasPrograms(uid: uid) { return true }
+            usleep(250_000)
+        }
+        return !hasPrograms(uid: uid)
     }
 
     /// Lets the restored folder take the place of the home folder, which moves to `aside`. When

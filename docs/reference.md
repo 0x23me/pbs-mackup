@@ -178,6 +178,27 @@ which. Then, after a question that `--yes` answers:
    the second step fails the first is undone. Moving a home folder needs Full Disk Access for
    the terminal.
 
+### From the app
+
+**Restore from a Backup…** does the same for the user who is logged in, without a second
+administrator. Its root part is the run tool as the launchd daemon `<bundle identifier>.restore`
+(`pbs-mackup-run restore-daemon`), which the app registers with `SMAppService` when the window
+needs it and unregisters at Finish; macOS asks the owner to allow it under Login Items.
+
+- It answers only the app, checked by the code signature of the connection.
+- Every message carries the external form of an authorization for the right
+  `<bundle identifier>.restore-home`, which the daemon checks without asking anyone. Its rule:
+  an administrator authenticates, and that holds for five minutes in that one authorization.
+  An administrator can change it with `security authorizationdb`; a rule of their own is kept.
+- Token, key and passphrase arrive in the messages and go to the client on descriptors.
+- The restore goes to `<home>.restored`; the state, without secrets, is in
+  `/Library/Application Support/<bundle identifier>/restore.json`. Once the user has no login
+  session left, the daemon ends what macOS keeps running for them (their launchd domain, then
+  any program still running as them) and swaps the folders. A login before that puts the swap
+  off to the next logout; a restart while restoring throws the restore away.
+- The cloud folders are left out (`Library/Mobile Documents`, `Library/CloudStorage`, iCloud
+  Drive's file provider and its state); their contents come back from the cloud.
+
 ## When a run reads everything
 
 A run notes where the macOS change log (FSEvents) stands before it takes its snapshot. The

@@ -114,30 +114,29 @@ runs with the token and the key.
 ### After losing the Mac
 
 The whole home folder comes back on a freshly installed Mac, and you log in to it as before:
-files, settings, the login keychain, and PBS Mackup with its settings and key. It can't be put
-back while you are logged in, so a second administrator does it.
+files, settings, the login keychain, and PBS Mackup with its settings and key.
 
 1. Install macOS. In Setup Assistant, make your account with the same short name as before
    (`me`) and your old password, which the old login keychain opens with.
-2. In System Settings, add an administrator `setup`, log out (not just switch users) and log in
-   as `setup`. Install PBS Mackup, give Terminal Full Disk Access, and have the recovery copy of
-   the key at hand.
-3. Restore, which asks for the token secret and, when the key file has one, its passphrase:
+2. Install PBS Mackup and choose **Restore from a Backup…** in its menu. Turn on Full Disk
+   Access and allow the restore helper, as the window asks; enter the server, the token and
+   the recovery copy of the key.
+3. **Find Backups** has an administrator allow the restore and picks the newest snapshot;
+   **Restore…** starts it. You can keep working meanwhile, but what you save in this account
+   until you log out is set aside.
+4. When it says so, log out and log in again. The restored home folder is in place; **Finish**
+   deletes the one from before and removes the helper.
 
-   ```sh
-   sudo /Applications/PBSMackup.app/Contents/MacOS/pbs-mackup-run restore-home me \
-     'mac@pbs!backup@pbs.example.net:store' key.json --ns mac
-   ```
-
-   It takes the newest snapshot that has `me.pxar`, restores it next to the new home folder,
-   and swaps the two once it is complete; the new one is kept as `/Users/me.before-restore`.
-4. Restart and log in as `me`. Once everything is there, delete `setup` and
-   `/Users/me.before-restore`.
+The restore helper is the part of PBS Mackup that runs as root. It is only registered while you
+restore, takes messages from the app alone, and does nothing without an administrator's password
+or Touch ID. From a terminal, the same works with `sudo pbs-mackup-run restore-home me
+'mac@pbs!backup@pbs.example.net:store' key.json --ns mac`, run from another administrator's
+account while `me` is logged out.
 
 Not in the backup and so not back: the apps (install them again), Full Disk Access and the other
-permissions in Privacy & Security (PBS Mackup needs its Full Disk Access again), what is excluded
-from Time Machine, caches, and keychain items that belong to the old Mac's hardware. PBS Mackup's
-next run reads everything. This has not been tried with iCloud Drive signed in yet.
+permissions in Privacy & Security, what is excluded from Time Machine, caches, and keychain items
+that belong to the old Mac's hardware. iCloud Drive and other cloud storage are left out of the
+restore; they sync again once you sign in. PBS Mackup's next run reads everything.
 
 ### Without the Mac
 

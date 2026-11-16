@@ -1,4 +1,5 @@
 import AppKit
+import PBSMackupKit
 import SwiftUI
 
 // The picture modes are for development and only in a debug build (`swift build`). The app as it
@@ -16,8 +17,13 @@ enum Render {
         guard arguments.count >= 2 else { print("usage: PBSMackup --render settings|timeline <file.png>"); exit(64) }
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
-        let view: AnyView = arguments[0] == "timeline" ? AnyView(TimelineView()) : AnyView(SettingsView())
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 940, height: 700), styleMask: [.titled],
+        let view: AnyView, size: NSSize
+        switch arguments[0] {
+        case "timeline": (view, size) = (AnyView(TimelineView()), NSSize(width: 940, height: 700))
+        case "restore": (view, size) = (AnyView(RestoreView(preview: RestoreView.previewState(arguments.dropFirst(2).first))), NSSize(width: 600, height: 640))
+        default: (view, size) = (AnyView(SettingsView()), NSSize(width: 940, height: 700))
+        }
+        let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled],
                               backing: .buffered, defer: false)
         // The window's own backdrop is not part of what a view draws into an image.
         window.contentView = NSHostingView(rootView: view.background(Color(nsColor: .windowBackgroundColor)))
@@ -32,6 +38,19 @@ enum Render {
         }
         app.run()
         exit(0)
+    }
+}
+
+extension RestoreView {
+    /// What `--render restore <file> [form|restoring|waitingForLogout|done|failed]` shows.
+    static func previewState(_ phase: String?) -> RestoreState? {
+        guard let phase, let phase = RestoreState.Phase(rawValue: phase) else { return nil }
+        return RestoreState(phase: phase, user: "me", uid: 501, home: "/Users/me", snapshot: "host/old-mac/2026-11-12T08:00:00Z",
+                            archive: "me.pxar", progress: 0.42,
+                            message: phase == .failed ? "The Mac restarted while the home folder was being restored. Start the restore again." : nil,
+                            notes: ["21,781 files are now owned by your account on this Mac (uid 503 on the old Mac, 501 here).",
+                                    "Sharing permissions that named you on the old Mac now name your account here (1 item).",
+                                    "iCloud Drive and other cloud storage were left out. They sync again once you sign in."])
     }
 }
 

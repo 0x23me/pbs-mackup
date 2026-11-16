@@ -33,7 +33,7 @@ swift build -c release
 bin="$(swift build -c release --show-bin-path)"
 app=".build/PBSMackup.app"
 rm -rf "$app"
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Helpers" "$app/Contents/Resources" "$app/Contents/Library/LaunchAgents"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Helpers" "$app/Contents/Resources" "$app/Contents/Library/LaunchAgents" "$app/Contents/Library/LaunchDaemons"
 cp "$bin/PBSMackup" "$bin/pbs-mackup-run" "$app/Contents/MacOS/"
 # The client is there twice. The first does every backup, listing and restore. It has no folder
 # to look for FUSE-T's library in, so it loads nothing but what macOS ships. The second is only
@@ -62,6 +62,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
   <key>NSHumanReadableCopyright</key><string>BSD-3-Clause. The client inside is AGPL-3.0, from Proxmox Backup. Not a Proxmox product.</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>PBS Mackup logs you out at the end of a restore from a backup, so that your restored home folder can take the place of this one.</string>
 </dict></plist>
 PLIST
 
@@ -121,6 +122,23 @@ cat > "$agents/${id}.helper.plist" <<PLIST
 </dict></plist>
 PLIST
 
+# `restore`: the run tool as root, which restores a whole home folder for the app and lets it
+# take the place of the owner's once they log out. The app registers it only while the owner
+# restores this Mac from a backup, and takes it away after. launchd starts it at boot too, so
+# that a restore that waits for the logout keeps waiting after a restart.
+cat > "$app/Contents/Library/LaunchDaemons/${id}.restore.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${id}.restore</string>
+  <key>BundleProgram</key><string>Contents/MacOS/pbs-mackup-run</string>
+  <key>ProgramArguments</key><array><string>pbs-mackup-run</string><string>restore-daemon</string></array>
+  <key>MachServices</key><dict><key>${id}.restore</key><true/></dict>
+  <key>RunAtLoad</key><true/>
+  <key>AssociatedBundleIdentifiers</key><array><string>${id}</string></array>
+</dict></plist>
+PLIST
+
 # A run mounts its snapshot in the app's group container, where macOS asks the owner before it
 # lets another developer's program in; the files a run restores to check them and a new key on
 # its way into the Keychain go there too. The app, the run tool and the clients say that the
@@ -137,9 +155,11 @@ if [ -n "$team" ]; then
     group="--entitlements .build/groups.entitlements"
     mount="--entitlements .build/mount.entitlements"
 fi
-for name in groups mount; do
+for name in groups mount app; do
     library=""
     [ "$name" = mount ] && library="<key>com.apple.security.cs.disable-library-validation</key><true/>"
+    # The app alone sends an Apple event: Log Out at the end of a restore, to loginwindow.
+    [ "$name" = app ] && library="<key>com.apple.security.automation.apple-events</key><true/>"
     cat > ".build/$name.entitlements" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -161,6 +181,7 @@ codesign --force --options runtime --timestamp --sign "$identity" -i "${id}.clie
 # this name can read them for good. The versions before 0.2 signed as ".run" and handed the key
 # to whoever asked, which is why the name changed; it must not be given to a tool that does.
 codesign --force --options runtime --timestamp --sign "$identity" -i "${id}.tool" $group "$app/Contents/MacOS/pbs-mackup-run"
-codesign --force --options runtime --timestamp --sign "$identity" $group "$app"
+app_entitlements="--entitlements .build/app.entitlements"
+codesign --force --options runtime --timestamp --sign "$identity" $app_entitlements "$app"
 codesign --verify --deep --strict "$app"
 echo "built $app ($version, $id)"

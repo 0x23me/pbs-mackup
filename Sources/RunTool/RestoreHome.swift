@@ -71,21 +71,7 @@ func restoreHome(_ call: Call) throws -> Data {
 
     try HomeRestore.restore(client, snapshot: snapshot.name, archive: archive, into: restored) { FileHandle.standardOutput.write($0) }
 
-    var notes: [String] = []
-    var info = stat()
-    if lstat(restored.path, &info) == 0, info.st_uid != account.uid {
-        let reowned = HomeRestore.reown(restored, from: info.st_uid, to: account.uid)
-        notes.append("\(reowned.changed) items belonged to uid \(info.st_uid) on the old Mac and now belong to \(account.name).")
-        if !reowned.failed.isEmpty { notes.append("These still belong to uid \(info.st_uid): \(reowned.failed.prefix(10).joined(separator: ", "))") }
-    }
-    let strangers = HomeRestore.strangers(in: restored)
-    if strangers.count == 1, let old = strangers.first, let new = HomeRestore.generatedUID(of: account.uid) {
-        let replaced = HomeRestore.replaceInACLs(restored, old, with: new)
-        notes.append("\(replaced.changed) ACLs named \(account.name) as the old Mac knew them and now name the account here.")
-        if !replaced.failed.isEmpty { notes.append("These ACLs could not be changed: \(replaced.failed.prefix(10).joined(separator: ", "))") }
-    } else if strangers.count > 1 {
-        notes.append("ACLs name \(strangers.count) users or groups this Mac does not know; they were left as they are.")
-    }
+    let notes = HomeRestore.adapt(restored, to: account)
 
     try HomeRestore.swap(home: account.home, restored: restored, aside: aside)
     return Data((notes + ["""

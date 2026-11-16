@@ -107,6 +107,12 @@ public enum Identity {
     /// for what needs the token or the key.
     public static var helperLabel: String { bundleID + ".helper" }
     public static var jobs: [String] { [scheduledLabel, manualLabel, helperLabel] }
+    /// The launchd daemon, and its service, that restores a whole home folder as root. Only
+    /// registered while the owner restores this Mac from a backup; see `RestoreService`.
+    public static var restoreLabel: String { bundleID + ".restore" }
+    /// The right in the authorization database that a restore of a home folder asks for. Its
+    /// rule is that an administrator authenticates; an administrator can make it stricter.
+    public static var restoreRight: String { bundleID + ".restore-home" }
 
     /// The Team ID of the developer who signed the running program, from its code signature.
     /// Nil for a program no developer signed, and in every development build, whatever runs it.

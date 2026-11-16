@@ -245,6 +245,11 @@ let commands: [Command] = [
                 return try json(SetupStatus(configured: (try? Config.load()) != nil, token: try Keychain.get(.token) != nil,
                                             key: try KeyStore.status()))
             }),
+    Command(name: "restore-daemon", what: "restore a home folder for the app, as root (what launchd starts while the app restores this Mac)",
+            run: .plain { _ in
+                guard geteuid() == 0 else { throw Failure(description: "restore-daemon is what launchd starts as root for the app.") }
+                RestoreService.serve()
+            }),
     // Root runs it with sudo, which has the administrator's password already; nothing more is asked.
     Command(name: "restore-home", arguments: restoreHomeArguments,
             what: "with sudo, from another administrator: a user's whole home folder back from a backup, on a new Mac",
