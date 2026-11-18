@@ -323,6 +323,13 @@ Everything is read when:
   record;
 - the run was started with `--full`.
 
+Apple calls the change log advisory and recommends a full read now and then, hence the seven
+days. To read everything now:
+
+```sh
+/Applications/PBSMackup.app/Contents/MacOS/pbs-mackup-run --full
+```
+
 ## State file
 
 `pbs-mackup-run` rewrites `state.json` atomically and is the only one to write it; the app

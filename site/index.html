@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PBS Mackup, Mac backups to a Proxmox Backup Server</title>
+<meta name="description" content="A menu bar app that backs up a Mac's home folder to a Proxmox Backup Server in the background.">
+<link rel="icon" href="img/icon-256.png">
+<link rel="preload" href="/kit/fonts/inter-latin-wght-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/kit/fonts/chakra-petch-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/kit/0x23.css">
+<script src="/kit/0x23.js"></script>
+</head>
+<body id="top">
+<a class="skip" href="#main">Skip to content</a>
+<div class="frame">
+    <header class="top">
+        <div class="top__inner">
+            <nav class="nav" aria-label="Sections">
+                <a class="nav__mark" href="./"><img src="img/icon-256.png" width="28" height="28" alt="">PBS MACKUP</a>
+                <div class="nav__links">
+                    <a href="#what">What it does</a>
+                    <a href="#server">Server</a>
+                    <a href="https://github.com/0x23me/pbs-mackup">Source ↗</a>
+                    <button class="nav__theme" type="button" aria-label="Switch between light and dark"><svg aria-hidden="true" width="16" height="16" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.25" fill="none" stroke="currentColor" stroke-width="1.5"></circle><path d="M8 1.75a6.25 6.25 0 0 1 0 12.5z" fill="currentColor"></path></svg></button>
+                </div>
+            </nav>
+            <div class="status">
+                <span>Made with <em class="hl">curiosity</em></span>
+            </div>
+        </div>
+    </header>
+
+    <main id="main">
+    <section class="hero">
+        <div class="hero__head">
+            <p class="eyebrow"><span class="eyebrow__bar"></span>PBS Mackup · macOS menu bar app</p>
+            <h1>Backs up a Mac to a Proxmox Backup Server.</h1>
+            <p class="hero__lead">I had a PBS keeping history for everything else in the house and no way to put the laptop in there. This is that.</p>
+            <div class="actions">
+                <a class="btn btn--accent" href="https://github.com/0x23me/pbs-mackup/releases/latest">Download for macOS ↗</a>
+                <a class="btn" href="#server">Set up the server →</a>
+            </div>
+            <p class="version">Version 0.6.0 · Apple silicon, macOS 26 or later, PBS 4.x</p>
+        </div>
+        <div class="projects">
+            <div class="feature feature--wide">
+                <div class="feature__text">
+                    <span class="feature__name">Install with Homebrew</span>
+                    <div class="cmds">
+                        <div class="cmd"><code>brew tap 0x23me/tap</code><button class="cmd__copy" type="button" aria-label="Copy"><svg class="glyph" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M4 16V5a1 1 0 0 1 1-1h11"/></svg><svg class="tick" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+                        <div class="cmd"><code>brew trust --cask 0x23me/tap/pbs-mackup</code><button class="cmd__copy" type="button" aria-label="Copy"><svg class="glyph" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M4 16V5a1 1 0 0 1 1-1h11"/></svg><svg class="tick" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+                        <div class="cmd"><code>brew install --cask 0x23me/tap/pbs-mackup</code><button class="cmd__copy" type="button" aria-label="Copy"><svg class="glyph" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="8" y="8" width="13" height="13" rx="2"/><path d="M4 16V5a1 1 0 0 1 1-1h11"/></svg><svg class="tick" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg></button></div>
+                        <p class="cmds__note">Or take the zip from the <a href="https://github.com/0x23me/pbs-mackup/releases/latest">latest release</a> and move the app to Applications.</p>
+                    </div>
+                    <p>Browse and search snapshots, see a file's versions, restore.</p>
+                </div>
+                <div class="well"><img class="for-light" src="img/backups-light.png" width="506" height="302" loading="lazy" alt="The Backups window: snapshots on the left, the files of one folder on the right."><img class="for-dark" src="img/backups-dark.png" width="506" height="302" loading="lazy" alt="The Backups window: snapshots on the left, the files of one folder on the right."></div>
+            </div>
+        </div>
+    </section>
+
+    <div class="rule" aria-hidden="true"><span>+</span><span>+</span></div>
+
+    <section class="section" id="what">
+        <div class="head">
+            <div class="head__text">
+                <span class="label">01 / What it does</span>
+                <h2>It backs up your user folder, not the system. <span class="dim">Getting a Mac back means: install macOS, install this, restore.</span></h2>
+            </div>
+        </div>
+        <div class="focus">
+            <div class="focus__card focus__card--dark">
+                <div class="focus__top"><span class="focus__label">01 · ENCRYPTED</span></div>
+                <p>Encrypted on the Mac, read from a frozen APFS snapshot. After the first run it reads only the folders macOS reports as changed.</p>
+            </div>
+            <div class="focus__card">
+                <div class="focus__top"><span class="focus__label">02 · MAC METADATA</span></div>
+                <p>Keeps extended attributes, tags, resource forks, creation dates and ACLs. The file contents stay readable with the stock Linux client.</p>
+            </div>
+            <div class="focus__card">
+                <div class="focus__top"><span class="focus__label">03 · CHECKED</span></div>
+                <p>Restores a few files from each new snapshot and compares them with the originals.</p>
+            </div>
+        </div>
+        <div class="projects">
+            <div class="feature feature--wide">
+                <div class="well"><img class="for-light" src="img/what-to-back-up-light.png" width="506" height="420" loading="lazy" alt="What to Back Up: the home folder largest first, with what is left out."><img class="for-dark" src="img/what-to-back-up-dark.png" width="506" height="420" loading="lazy" alt="What to Back Up: the home folder largest first, with what is left out."></div>
+                <div class="feature__text">
+                    <span class="feature__name">What to back up</span>
+                    <p>Shows your home folder largest first, so you can untick what you don't need.</p>
+                    <p>Caches, the Trash, files that only exist in iCloud and what apps mark as not worth backing up are left out.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <div class="rule" aria-hidden="true"><span>+</span><span>+</span></div>
+
+    <section class="section split" id="server">
+        <div class="split__intro">
+            <span class="label">02 / On the server</span>
+            <h2>On the server.</h2>
+            <div class="split__text">
+                <p>A namespace for the Mac, a user of its own, and a token of that user that can only add backups there.</p>
+                <p>The commands are in the <a href="https://github.com/0x23me/pbs-mackup#on-the-server">README</a>.</p>
+            </div>
+        </div>
+        <ul class="rows split__side">
+            <li><span class="rows__key">namespace</span><span class="rows__text"><code>mac</code> in your datastore.</span></li>
+            <li><span class="rows__key">user</span><span class="rows__text"><code>mac@pbs</code>, with no password.</span></li>
+            <li><span class="rows__key">token</span><span class="rows__text"><code>mac@pbs!backup</code>. The app keeps it in the keychain.</span></li>
+            <li><span class="rows__key">role</span><span class="rows__text"><code>DatastoreBackup</code> can't delete or prune, so thinning out old snapshots is the server's job.</span></li>
+        </ul>
+    </section>
+    </main>
+
+    <footer class="foot">
+        <div class="foot__card">
+            <div class="foot__main">
+                <div class="foot__links">
+                    <span class="version">Version 0.6.0 · BSD-3-Clause</span>
+                    <a href="https://github.com/0x23me/pbs-mackup/releases">Releases ↗</a>
+                    <a href="https://github.com/0x23me/pbs-mackup/issues">Issues ↗</a>
+                </div>
+            </div>
+            <nav class="foot__family" aria-label="More from 0x23">
+                <span>MORE FROM 0X23</span>
+                <a href="/priel/"><img src="/kit/logos/priel.png" width="20" height="20" alt="">Priel</a>
+                <a href="/ppe-pve-t2/"><img src="/kit/logos/pve-t2.svg" width="20" height="20" alt="">Proxmox T2 kernel</a>
+                <a href="/">All projects →</a>
+            </nav>
+        </div>
+    </footer>
+</div>
+</body>
+</html>
